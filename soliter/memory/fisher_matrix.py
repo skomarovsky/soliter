@@ -72,8 +72,14 @@ class FisherInformationMatrix:
             states = batch[0].to(self.device)
             batch_size = states.shape[0]
             
+            # Reset hidden state to match batch size
+            if hasattr(model, 'reset_hidden'):
+                hidden = model.reset_hidden(batch_size=batch_size, device=self.device)
+            else:
+                hidden = None
+            
             # Forward pass
-            outputs, _ = model(states)
+            outputs, _ = model(states, hidden=hidden, return_hidden=True) if hidden is not None else model(states)
             
             # For each output dimension, compute gradient
             for i in range(outputs.shape[1]):

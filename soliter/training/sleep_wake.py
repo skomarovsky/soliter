@@ -22,6 +22,21 @@ from ..memory.fisher_matrix import FisherInformationMatrix
 from .ewc import EWCLoss
 
 
+# PyTorch 2.6+ security: allowlist numpy for checkpoint loading
+try:
+    import torch.serialization
+    torch.serialization.add_safe_globals([
+        np.ndarray,
+        np.dtype,
+    ])
+    if hasattr(np, '_core') and hasattr(np._core, 'multiarray'):
+        torch.serialization.add_safe_globals([np._core.multiarray._reconstruct])
+    if hasattr(np, 'core') and hasattr(np.core, 'multiarray'):
+        torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+except (AttributeError, TypeError):
+    pass
+
+
 @dataclass
 class TrainingConfig:
     """Configuration for sleep-wake training."""
@@ -48,6 +63,10 @@ class TrainingConfig:
     buffer_capacity: int = 1_000_000
     prune_uncertainty_threshold: float = 0.1
     prune_td_threshold: float = 0.05
+    
+    # Uncertainty estimation
+    uncertainty_num_samples: int = 10
+    uncertainty_perturbation_scale: float = 0.1
     
     # Checkpointing
     checkpoint_interval: int = 10  # Days
@@ -313,10 +332,17 @@ class SleepWakeTrainer:
             scaling_rate=self.config.scaling_rate,
         )
         
-        # Step 4: Epistemic Pruning
-        print("  [Pruning] Removing consolidated memories...")
-        self.replay_buffer.update_uncertainties(self.agent.brain, num_samples=10)
+        # Step 4: Epistemic Pruning with Fisher-informed uncertainty
+        print("  [Pruning] Computing Fisher-informed uncertainties...")
+        self.replay_buffer.update_uncertainties(
+            self.agent.brain,
+            num_samples=self.config.uncertainty_num_samples,
+            fisher_matrix=self.fisher_matrix,
+            perturbation_scale=self.config.uncertainty_perturbation_scale,
+        )
         self.replay_buffer.update_td_errors(self.agent.brain)
+        
+        print("  [Pruning] Removing consolidated memories...")
         pruned = self.replay_buffer.prune_consolidated()
         
         # Step 5: Fisher decay
@@ -330,14 +356,20 @@ class SleepWakeTrainer:
         self.total_sleep_cycles += 1
         self.last_sleep_tick = self.world.tick
         
+        # Gather statistics
+        buffer_stats = self.replay_buffer.get_stats()
         stats = {
             'scale_factor': scale_factor,
             'transitions_pruned': pruned,
             'buffer_size': len(self.replay_buffer),
             'fisher_stats': self.fisher_matrix.get_stats(),
+            'avg_uncertainty': buffer_stats.get('avg_uncertainty', 1.0),
+            'avg_td_error': buffer_stats.get('avg_td_error', 1.0),
+            'near_consolidated': buffer_stats.get('near_consolidated', 0),
         }
         
         print(f"  ✓ Sleep complete: pruned {pruned}, buffer {len(self.replay_buffer)}")
+        print(f"    Avg uncertainty: {stats['avg_uncertainty']:.4f}, Avg TD: {stats['avg_td_error']:.4f}")
         return stats
     
     def _update_fisher_matrix(self) -> None:
@@ -391,11 +423,14 @@ class SleepWakeTrainer:
             },
             'stats': self.stats,
             'config': self.config,
+            'total_wake_ticks': self.total_wake_ticks,
+            'total_sleep_cycles': self.total_sleep_cycles,
+            'last_sleep_tick': self.last_sleep_tick,
         }, path)
     
     def load_checkpoint(self, path: str) -> None:
         """Load complete training state."""
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, weights_only=False)
         
         self.agent.brain.load_state_dict(checkpoint['agent_brain'])
         self.agent.load_state_dict(checkpoint['agent_state'])
@@ -404,3 +439,14 @@ class SleepWakeTrainer:
         self.fisher_matrix.fisher_diagonal = checkpoint['fisher_matrix']['fisher_diagonal']
         self.fisher_matrix.optimal_weights = checkpoint['fisher_matrix']['optimal_weights']
         self.stats = checkpoint['stats']
+        
+        # Load additional state if present (backwards compatibility)
+        if 'total_wake_ticks' in checkpoint:
+            self.total_wake_ticks = checkpoint['total_wake_ticks']
+        if 'total_sleep_cycles' in checkpoint:
+            self.total_sleep_cycles = checkpoint['total_sleep_cycles']
+        if 'last_sleep_tick' in checkpoint:
+            self.last_sleep_tick = checkpoint['last_sleep_tick']
+        
+        # Reset hidden state after loading
+        self.agent.brain.reset_hidden(batch_size=1, device=self.device)
