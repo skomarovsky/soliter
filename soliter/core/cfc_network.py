@@ -60,6 +60,9 @@ class CfCBrain(nn.Module):
             motor_size=motor_size,
         )
         
+        # Build the wiring with input size to create connection matrices
+        self.wiring.build(sensory_size)
+        
         # CfC RNN layer with NCP wiring
         self.cfc = CfC(
             input_size=sensory_size,
@@ -156,24 +159,18 @@ class CfCBrain(nn.Module):
             return motor_output, new_hidden
         return motor_output, None
     
-    def _get_interneuron_activity(self, hidden: torch.Tensor) -> torch.Tensor:
-        """
-        Extract interneuron layer activations from hidden state.
-        
-        The hidden state contains all neuron activations. We need to
-        extract just the interneurons for homeostatic scaling.
-        
-        Args:
-            hidden: Full hidden state tensor
+    def _get_interneuron_activity(self, hidden) -> torch.Tensor:
+        """Extract interneuron activations from hidden state."""
+        # Handle tuple hidden state (h, c) from mixed_memory
+        if isinstance(hidden, tuple):
+            h_state = hidden[0]
+        else:
+            h_state = hidden
             
-        Returns:
-            Interneuron activations only
-        """
-        # In NCP wiring, interneurons come after sensory but before command
-        start_idx = self.sensory_size
-        end_idx = start_idx + self.inter_size
-        return hidden[..., start_idx:end_idx]
-    
+        # Interneurons are indices 0 to inter_size-1
+        start_idx = 0
+        end_idx = len(self.wiring._inter_neurons)
+        return h_state[..., start_idx:end_idx]
     def reset_hidden(self, batch_size: int = 1, device: Optional[torch.device] = None) -> None:
         """Reset the hidden state (e.g., at start of episode)."""
         if device is None:
