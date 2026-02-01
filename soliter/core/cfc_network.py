@@ -171,7 +171,7 @@ class CfCBrain(nn.Module):
         start_idx = 0
         end_idx = len(self.wiring._inter_neurons)
         return h_state[..., start_idx:end_idx]
-    def reset_hidden(self, batch_size: int = 1, device: Optional[torch.device] = None) -> None:
+    def reset_hidden(self, batch_size: int = 1, device: Optional[torch.device] = None):
         """Reset the hidden state (e.g., at start of episode)."""
         if device is None:
             device = next(self.parameters()).device
@@ -179,6 +179,7 @@ class CfCBrain(nn.Module):
         h_state = torch.zeros(batch_size, self.wiring.units, device=device)
         c_state = torch.zeros(batch_size, self.wiring.units, device=device)
         self.hidden_state = (h_state, c_state)
+        return self.hidden_state
     def get_mean_activity(self) -> torch.Tensor:
         """Get the current mean activity of interneurons."""
         return self.mean_activity.clone()
@@ -295,7 +296,7 @@ class SimpleMLP(nn.Module):
         
         return output, None
     
-    def reset_hidden(self, batch_size: int = 1, device: Optional[torch.device] = None) -> None:
+    def reset_hidden(self, batch_size: int = 1, device: Optional[torch.device] = None):
         """Reset the hidden state (e.g., at start of episode)."""
         if device is None:
             device = next(self.parameters()).device
@@ -303,3 +304,4 @@ class SimpleMLP(nn.Module):
         h_state = torch.zeros(batch_size, self.wiring.units, device=device)
         c_state = torch.zeros(batch_size, self.wiring.units, device=device)
         self.hidden_state = (h_state, c_state)
+        return self.hidden_state

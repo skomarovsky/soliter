@@ -85,6 +85,9 @@ class SoliterAgent:
         # Statistics
         self.lifetime_reward = 0.0
         self.cause_of_death: Optional[str] = None
+        
+        # Initialize brain hidden state
+        self.brain.reset_hidden(batch_size=1, device=device)
     
     def reset(self, position: Optional[np.ndarray] = None) -> None:
         """Reset agent to initial state."""
