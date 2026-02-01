@@ -1,0 +1,108 @@
+# Soliter Default Configuration
+# Version: 1.0
+
+experiment:
+  name: "soliter_baseline"
+  seed: 42
+  device: "cuda"  # or "cpu"
+  save_dir: "data/experiments"
+  checkpoint_interval: 10  # Save every N days
+
+world:
+  size: [1000, 1000]
+  seasonal_period: 20000  # ticks per year
+  diurnal_period: 2000    # ticks per day
+  dt: 0.1                 # physics timestep
+  
+  # Resource configuration
+  resources:
+    feeders: 4
+    fountains: 4
+    heaters: 3
+
+agent:
+  # Initial vitals
+  initial_energy: 100.0
+  initial_hydration: 100.0
+  initial_temperature: 37.0  # Celsius
+  initial_wakefulness: 1.0
+  
+  # Vital decay rates
+  energy_decay_base: 0.01
+  hydration_decay_base: 0.008
+  temperature_decay_rate: 0.05
+  wakefulness_decay_rate: 0.0001
+  
+  # Movement parameters
+  base_speed: 2.0
+  base_turn_rate: 0.1
+  
+  # Sleep threshold
+  sleep_threshold: 0.3
+
+brain:
+  architecture: "cfc_ncp"
+  
+  # Layer sizes
+  sensory_neurons: 41      # 4 vitals + 36 raycasts + 1 touch
+  inter_neurons: 256       # Main memory layer
+  command_neurons: 64      # Motor planning
+  motor_neurons: 3         # velocity, turn, sleep
+  
+  # CfC parameters
+  time_constant_min: 0.5
+  time_constant_max: 5.0
+  ode_solver: "euler"      # or "rk4"
+
+memory:
+  # Replay buffer
+  buffer_max_size: 1_000_000
+  batch_size: 32
+  min_samples_before_training: 1000
+  
+  # Fisher Information
+  fisher_decay: 0.77
+  ewc_lambda: 155000       # Extreme protection
+  
+  # Epistemic pruning thresholds
+  uncertainty_threshold: 0.1
+  loss_threshold: 0.05
+  fisher_threshold: 0.5
+  stability_time: 5  # days
+
+training:
+  # Optimizer
+  optimizer: "adam"
+  learning_rate: 0.0001
+  gradient_clip: 1.0
+  
+  # RL parameters
+  gamma: 0.99              # Discount factor
+  
+  # Sleep-wake cycle
+  sleep_epochs: 5
+  scaling_rate: 0.01
+  target_activity: 0.5
+
+visualization:
+  render: true
+  fps: 60
+  window_size: [1200, 800]
+  show_raycasts: true
+  show_vitals: true
+  show_neural_activity: false  # Toggle for debugging
+
+logging:
+  use_tensorboard: true
+  use_wandb: false
+  log_interval: 100        # ticks
+  save_video: false
+  video_interval: 1000     # Save video every N ticks
+
+metrics:
+  # What to measure
+  measure_phi_seasonal: true
+  phi_measurement_interval: 10  # days
+  measure_preferences: true
+  preference_test_interval: 20  # days
+  measure_self_model: false     # Expensive, enable for specific experiments
