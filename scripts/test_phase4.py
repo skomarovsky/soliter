@@ -201,6 +201,9 @@ def main():
         sleep_epochs=3,
         uncertainty_num_samples=10,
         uncertainty_perturbation_scale=0.1,
+        # Relaxed thresholds for testing (default: 0.1 and 0.05)
+        prune_uncertainty_threshold=0.5,  # Was 0.1
+        prune_td_threshold=1.2,           # Was 0.05
     )
     
     trainer = SleepWakeTrainer(

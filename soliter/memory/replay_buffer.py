@@ -361,29 +361,25 @@ class ReplayBuffer:
             for i, transition in enumerate(batch_transitions):
                 transition.td_error = td_errors[i].item()
     
-    def prune_consolidated(self) -> int:
-        """
-        Remove consolidated experiences (low uncertainty AND low TD-error).
+    def prune_consolidated(self, max_prune: int = None) -> int:
+        """Remove consolidated transitions."""
+        to_remove = []
+        for i, t in enumerate(self.buffer):
+            if t.uncertainty < self.prune_threshold_uncertainty and \
+            t.td_error < self.prune_threshold_td_error:
+                to_remove.append(i)
         
-        Returns:
-            Number of transitions pruned
-        """
-        original_size = len(self.buffer)
+        # Respect max_prune limit
+        if max_prune is not None and len(to_remove) > max_prune:
+            # Keep only the most consolidated (lowest uncertainty)
+            to_remove = sorted(to_remove, key=lambda i: self.buffer[i].uncertainty)[:max_prune]
         
-        self.buffer = [
-            t for t in self.buffer
-            if not (
-                t.uncertainty < self.prune_threshold_uncertainty and
-                t.td_error < self.prune_threshold_td_error
-            )
-        ]
+        # Remove in reverse order to preserve indices
+        for i in sorted(to_remove, reverse=True):
+            self.buffer.pop(i)
+            self.total_pruned += 1
         
-        pruned = original_size - len(self.buffer)
-        self.total_pruned += pruned
-        
-        self.position = len(self.buffer) % self.capacity
-        
-        return pruned
+        return len(to_remove)
     
     def get_consolidation_candidates(self) -> List[Transition]:
         """Get transitions that are close to being consolidated (for debugging)."""
