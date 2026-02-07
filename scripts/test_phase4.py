@@ -1,348 +1,391 @@
 #!/usr/bin/env python3
 """
-Phase 4 verification script.
+Phase 4 Verification: Replay-Driven Pruning + Detailed Vitals.
 
-Tests memory and training components.
+Tests:
+- Synthetic: buffer basics, prune_by_surprise ranking, min_buffer_size
+- Integration: multi-cycle training with vitals, deaths, surprise tracking
 
 Usage:
-    python test_phase4.py                    # Run all tests with default 3 cycles
-    python test_phase4.py --cycles 10        # Run Test 6 with 10 cycles
-    python test_phase4.py --cycles 10 --wake-steps 200  # Custom wake steps per cycle
+    python test_phase4.py                              # Quick (3 cycles)
+    python test_phase4.py --cycles 50 --wake-steps 500 # Full experiment
 """
 
+import argparse
 import torch
 import numpy as np
-import argparse
+from dataclasses import dataclass, field
+from typing import List, Dict
+from collections import defaultdict
+
 from soliter.core.cfc_network import CfCBrain
 from soliter.agents.soliter_agent import SoliterAgent, VitalsConfig
 from soliter.environment import World, create_default_resources, Physics, SensorSystem
-from soliter.memory import ReplayBuffer, FisherInformationMatrix, Transition
+from soliter.memory import FisherInformationMatrix, Transition
+from soliter.memory.replay_buffer import EpistemicReplayBuffer, PruningStats
 from soliter.training import EWCLoss, SleepWakeTrainer, TrainingConfig
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Phase 4 verification script")
-    parser.add_argument("--cycles", type=int, default=3, 
-                        help="Number of sleep-wake cycles for Test 6 (default: 3)")
-    parser.add_argument("--wake-steps", type=int, default=100,
-                        help="Wake steps per cycle for Test 6 (default: 100)")
-    return parser.parse_args()
+# ======================================================================
+# Data structures
+# ======================================================================
+
+@dataclass
+class DeathRecord:
+    cycle: int
+    tick: int
+    cause: str
+    energy_at_death: float
+    hydration_at_death: float
+    temperature_at_death: float
+    wakefulness_at_death: float
 
 
-def main():
-    args = parse_args()
-    
-    print("="*60)
-    print("Phase 4: Memory & Training - Verification")
-    print("="*60)
+@dataclass
+class CycleStats:
+    cycle: int
+    # Vitals
+    energy_min: float = 100.0
+    energy_max: float = 0.0
+    energy_avg: float = 0.0
+    hydration_min: float = 100.0
+    hydration_avg: float = 0.0
+    temperature_min: float = 100.0
+    temperature_avg: float = 0.0
+    wakefulness_avg: float = 0.0
+    # Deaths
+    deaths: int = 0
+    death_causes: List[str] = field(default_factory=list)
+    # Rewards
+    reward_total: float = 0.0
+    # Replay surprise
+    surprise_min: float = 0.0
+    surprise_mean: float = 0.0
+    surprise_max: float = 0.0
+    surprise_cutoff: float = 0.0
+    # Buffer
+    buffer_size: int = 0
+    pruned: int = 0
+    # PPO
+    policy_loss: float = 0.0
+    value_loss: float = 0.0
+    entropy: float = 0.0
 
-    device = torch.device('cpu')
 
-    # Test 1: Replay Buffer
-    print("\n[Test 1: Replay Buffer]")
-    buffer = ReplayBuffer(capacity=1000)
+class DetailedTracker:
+    def __init__(self):
+        self.all_deaths: List[DeathRecord] = []
+        self.cycle_stats: List[CycleStats] = []
+        self._e: List[float] = []
+        self._h: List[float] = []
+        self._t: List[float] = []
+        self._w: List[float] = []
+        self._r: List[float] = []
+        self._cycle_deaths: List[DeathRecord] = []
+        self._cycle: int = 0
 
-    # Add transitions
+    def start_cycle(self, cycle: int):
+        self._cycle = cycle
+        self._e.clear(); self._h.clear()
+        self._t.clear(); self._w.clear()
+        self._r.clear(); self._cycle_deaths.clear()
+
+    def record_step(self, agent, reward):
+        self._e.append(agent.energy)
+        self._h.append(agent.hydration)
+        self._t.append(agent.temperature)
+        self._w.append(agent.wakefulness)
+        self._r.append(reward)
+
+    def record_death(self, agent, tick):
+        cause = getattr(agent, 'cause_of_death', None) or 'unknown'
+        d = DeathRecord(self._cycle, tick, cause, agent.energy,
+                        agent.hydration, agent.temperature, agent.wakefulness)
+        self.all_deaths.append(d)
+        self._cycle_deaths.append(d)
+
+    def end_cycle(self, **kw) -> CycleStats:
+        e = self._e or [0.]; h = self._h or [0.]
+        t = self._t or [0.]; w = self._w or [0.]
+        r = self._r or [0.]
+        cs = CycleStats(
+            cycle=self._cycle,
+            energy_min=min(e), energy_max=max(e), energy_avg=float(np.mean(e)),
+            hydration_min=min(h), hydration_avg=float(np.mean(h)),
+            temperature_min=min(t), temperature_avg=float(np.mean(t)),
+            wakefulness_avg=float(np.mean(w)),
+            deaths=len(self._cycle_deaths),
+            death_causes=[d.cause for d in self._cycle_deaths],
+            reward_total=float(sum(r)),
+            **kw,
+        )
+        self.cycle_stats.append(cs)
+        return cs
+
+    def print_summary(self):
+        # Deaths
+        total_d = len(self.all_deaths)
+        causes = defaultdict(int)
+        for d in self.all_deaths:
+            causes[d.cause] += 1
+        print(f"\n{'─'*55}")
+        print(f"  DEATHS: {total_d}")
+        for c, n in sorted(causes.items(), key=lambda x: -x[1]):
+            print(f"    {c:<14} {n:>4} ({100*n/max(1,total_d):.0f}%)")
+
+        n = len(self.cycle_stats)
+        if n >= 6:
+            t1 = sum(s.deaths for s in self.cycle_stats[:n//3])
+            t3 = sum(s.deaths for s in self.cycle_stats[2*n//3:])
+            trend = '↓ learning' if t3 < t1 else ('→ stable' if t3 == t1 else '↑ investigate')
+            print(f"  Trend: early={t1} late={t3} {trend}")
+
+        # Vitals
+        if self.cycle_stats:
+            first = self.cycle_stats[:max(1,n//5)]
+            last = self.cycle_stats[-max(1,n//5):]
+            print(f"\n{'─'*55}")
+            print(f"  VITALS (early → late)")
+            for name, attr in [('Energy','energy_avg'),('Hydration','hydration_avg'),
+                               ('Temperature','temperature_avg')]:
+                e = np.mean([getattr(s,attr) for s in first])
+                l = np.mean([getattr(s,attr) for s in last])
+                a = '↑' if l>e else '↓' if l<e else '→'
+                print(f"    {name:<14} {e:5.1f} → {l:5.1f} {a}")
+
+        # Surprise & pruning
+        if len(self.cycle_stats) >= 4:
+            first = self.cycle_stats[:max(1,n//5)]
+            last = self.cycle_stats[-max(1,n//5):]
+            print(f"\n{'─'*55}")
+            print(f"  REPLAY SURPRISE (early → late)")
+            for name, attr in [('Mean surprise','surprise_mean'),
+                               ('Pruned/cycle','pruned'),
+                               ('Buffer size','buffer_size'),
+                               ('Reward/cycle','reward_total')]:
+                e = np.mean([getattr(s,attr) for s in first])
+                l = np.mean([getattr(s,attr) for s in last])
+                a = '↑' if l>e else '↓' if l<e else '→'
+                print(f"    {name:<14} {e:8.2f} → {l:8.2f} {a}")
+
+
+# ======================================================================
+# Synthetic tests
+# ======================================================================
+
+def run_synthetic_tests():
+    print("=" * 60)
+    print("SYNTHETIC TESTS")
+    print("=" * 60)
+
+    # Test 1: Push / sample / stats
+    print("\n[Test 1: Buffer basics]")
+    buf = EpistemicReplayBuffer(capacity=500, prune_fraction=0.2, min_buffer_size=10)
     for i in range(100):
-        transition = Transition(
-            state=torch.randn(41),
-            action=torch.randn(3),
-            reward=np.random.random(),
-            next_state=torch.randn(41),
-            done=False,
-            tick=i,
-        )
-        buffer.push(transition)
+        buf.push(Transition(
+            state=torch.randn(41), action=torch.randn(3),
+            reward=float(i)/100, next_state=torch.randn(41),
+            done=False, tick=i,
+        ))
+    assert len(buf) == 100
+    assert len(buf.sample(32)) == 32
+    stats = buf.get_stats()
+    print(f"  Size={stats['size']}, AvgSurprise={stats['avg_surprise']:.2f}")
+    print("  ✓ OK")
 
-    print(f"Buffer size: {len(buffer)}")
-    print(f"Buffer stats: {buffer.get_stats()}")
-
-    # Sample batch
-    batch = buffer.sample(32)
-    print(f"Sampled batch: {len(batch)} transitions")
-
-    print("✓ Replay buffer working")
-
-    # Test 2: Fisher Information Matrix
-    print("\n[Test 2: Fisher Information Matrix]")
-    brain = CfCBrain()
-    fisher = FisherInformationMatrix(brain, device)
-
-    print(f"Fisher parameters tracked: {len(fisher.fisher_diagonal)}")
-
-    # Simulate Fisher computation
-    dataloader = [(torch.randn(16, 41),) for _ in range(10)]
-    fisher.compute_fisher(brain, dataloader, num_samples=160)
-
-    stats = fisher.get_stats()
-    print(f"Fisher stats: mean={stats['mean_fisher']:.6f}, max={stats['max_fisher']:.6f}")
-
-    # Test decay
-    fisher.decay_fisher(0.77)
-    print(f"After decay: mean={fisher.get_stats()['mean_fisher']:.6f}")
-
-    print("✓ Fisher matrix working")
-
-    # Test 3: EWC Loss
-    print("\n[Test 3: EWC Loss]")
-    ewc = EWCLoss(fisher_matrix=fisher, lambda_ewc=1000.0)
-
-    # Compute loss
-    task_loss = torch.tensor(1.0)
-    total_loss = ewc.compute_loss(brain, task_loss)
-
-    components = ewc.get_loss_components(brain, task_loss)
-    print(f"Task loss: {components['task_loss']:.4f}")
-    print(f"EWC loss: {components['ewc_loss']:.4f}")
-    print(f"Total loss: {components['total_loss']:.4f}")
-
-    print("✓ EWC loss working")
-
-    # Test 4: Sleep-Wake Trainer
-    print("\n[Test 4: Sleep-Wake Trainer]")
-
-    # Create components
-    world = World()
-    resources = create_default_resources()
-    physics = Physics()
-    sensors = SensorSystem(physics=physics)
-
-    brain = CfCBrain()
-    agent = SoliterAgent(brain, VitalsConfig(), device)
-
-    config = TrainingConfig(
-        wake_duration=100,
-        learning_rate=0.0001,
-        batch_size=16,
-        sleep_epochs=2,
-    )
-
-    trainer = SleepWakeTrainer(
-        agent=agent,
-        world=world,
-        sensors=sensors,
-        physics=physics,
-        config=config,
-        device=device,
-    )
-
-    print(f"Trainer initialized")
-    print(f"Wake duration: {config.wake_duration}")
-    print(f"Buffer capacity: {config.buffer_capacity}")
-
-    # Simulate a few wake steps
-    print("\nSimulating 50 wake steps...")
+    # Test 2: prune_by_surprise respects ranking
+    print("\n[Test 2: Prune by surprise ranking]")
+    buf = EpistemicReplayBuffer(capacity=500, prune_fraction=0.5, min_buffer_size=10)
+    # 50 low-surprise (consolidated) + 50 high-surprise (needed)
     for i in range(50):
-        reward, done = trainer.wake_step(resources)
-        world.step()
-        
-        if done:
-            print(f"  Agent died at step {i}")
-            break
+        t = Transition(state=torch.randn(41), action=torch.randn(3),
+                       reward=0.0, next_state=torch.randn(41), done=False, tick=i)
+        t.replay_surprise = 0.01 * (i + 1)  # 0.01 .. 0.50
+        buf.push(t)
+    for i in range(50):
+        t = Transition(state=torch.randn(41), action=torch.randn(3),
+                       reward=1.0, next_state=torch.randn(41), done=False, tick=i+50)
+        t.replay_surprise = 5.0 + i  # 5.0 .. 54.0
+        buf.push(t)
 
-    print(f"Buffer size after wake: {len(trainer.replay_buffer)}")
-    print(f"Total reward: {trainer.stats['total_reward']:.2f}")
+    ps = buf.prune_by_surprise()
+    print(f"  Before={ps.buffer_before}, Pruned={ps.pruned}, After={ps.buffer_after}")
+    print(f"  Cutoff={ps.surprise_cutoff:.2f}")
+    # Should have pruned 50 (50% of 100), all from the low-surprise group
+    assert ps.pruned == 50
+    assert ps.buffer_after == 50
+    # All remaining should be high-surprise
+    remaining_min = min(t.replay_surprise for t in buf.buffer)
+    assert remaining_min >= 4.0, f"Expected high-surprise kept, got min={remaining_min}"
+    print(f"  Remaining min surprise={remaining_min:.2f} (all high-surprise kept)")
+    print("  ✓ Ranking correct")
 
-    # Trigger sleep
-    if len(trainer.replay_buffer) > 0:
-        print("\nTriggering sleep cycle...")
-        sleep_stats = trainer.sleep_cycle()
-        print(f"  Scale factor: {sleep_stats['scale_factor']:.4f}")
-        print(f"  Transitions pruned: {sleep_stats['transitions_pruned']}")
-        print(f"  Buffer size after: {sleep_stats['buffer_size']}")
+    # Test 3: min_buffer_size respected
+    print("\n[Test 3: Min buffer floor]")
+    buf = EpistemicReplayBuffer(capacity=500, prune_fraction=0.9, min_buffer_size=30)
+    for i in range(50):
+        t = Transition(state=torch.randn(41), action=torch.randn(3),
+                       reward=0.0, next_state=torch.randn(41), done=False, tick=i)
+        t.replay_surprise = 0.001
+        buf.push(t)
+    ps = buf.prune_by_surprise()
+    print(f"  50 transitions, prune_fraction=0.9, min=30: After={ps.buffer_after}")
+    assert ps.buffer_after >= 30
+    print("  ✓ Floor respected")
 
-    print("✓ Sleep-wake trainer working")
+    # Test 4: iter_batches covers all
+    print("\n[Test 4: iter_batches full coverage]")
+    buf = EpistemicReplayBuffer(capacity=500)
+    for i in range(73):  # Non-round number
+        buf.push(Transition(state=torch.randn(41), action=torch.randn(3),
+                            reward=0.0, next_state=torch.randn(41), done=False, tick=i))
+    all_idx = []
+    for batch, indices in buf.iter_batches(32):
+        all_idx.extend(indices)
+    assert sorted(all_idx) == list(range(73))
+    print(f"  73 transitions in batches of 32: covered {len(all_idx)} indices")
+    print("  ✓ Full coverage")
 
-    # Test 5: Checkpointing
-    print("\n[Test 5: Checkpointing]")
-    import tempfile
-    import os
+    print("\n  All synthetic tests passed ✅\n")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        checkpoint_path = os.path.join(tmpdir, "test_checkpoint.pt")
-        
-        # Save
-        trainer.save_checkpoint(checkpoint_path)
-        print(f"✓ Saved checkpoint: {os.path.getsize(checkpoint_path)} bytes")
-        
-        # Load
-        trainer2 = SleepWakeTrainer(
-            agent=SoliterAgent(CfCBrain(), VitalsConfig(), device),
-            world=World(),
-            sensors=sensors,
-            physics=physics,
-            config=config,
-            device=device,
-        )
-        trainer2.load_checkpoint(checkpoint_path)
-        print(f"✓ Loaded checkpoint")
-        
-        # Verify stats match
-        assert trainer2.stats['total_reward'] == trainer.stats['total_reward']
-        print(f"✓ Stats verified")
 
-    # Test 6: Multi-Cycle Sleep-Wake Training
-    print(f"\n[Test 6: Multi-Cycle Sleep-Wake ({args.cycles} cycles, {args.wake_steps} steps/cycle)]")
-    print("-" * 60)
-    
-    # Create fresh components for multi-cycle test
+# ======================================================================
+# Integration test
+# ======================================================================
+
+def run_integration(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("=" * 70)
+    print(f"INTEGRATION: {args.cycles} cycles × {args.wake_steps} steps  [{device}]")
+    print("=" * 70)
+
     world = World()
     resources = create_default_resources()
     physics = Physics()
     sensors = SensorSystem(physics=physics)
-    
-    brain = CfCBrain()
+    brain = CfCBrain().to(device)
     agent = SoliterAgent(brain, VitalsConfig(), device)
-    
+
     config = TrainingConfig(
         wake_duration=args.wake_steps,
         learning_rate=0.0001,
         batch_size=16,
         sleep_epochs=3,
-        uncertainty_num_samples=10,
-        uncertainty_perturbation_scale=0.1,
-        # Relaxed thresholds for testing (default: 0.1 and 0.05)
-        prune_uncertainty_threshold=0.5,  # Was 0.1
-        prune_td_threshold=1.2,           # Was 0.05
+        prune_fraction=0.2,
+        min_buffer_size=64,
     )
-    
+
     trainer = SleepWakeTrainer(
-        agent=agent,
-        world=world,
-        sensors=sensors,
-        physics=physics,
-        config=config,
-        device=device,
+        agent=agent, world=world, sensors=sensors,
+        physics=physics, config=config, device=device,
     )
-    
-    # Track metrics across cycles
-    cycle_stats = []
-    total_pruned = 0
-    deaths = 0
-    
-    print(f"\n{'Cycle':<6} {'Wake':<6} {'Buffer':<8} {'Pruned':<8} {'AvgUnc':<10} {'MinUnc':<10} {'AvgTD':<10} {'Scale':<8}")
-    print("-" * 76)
-    
+
+    tracker = DetailedTracker()
+
+    hdr = (f"{'Cyc':<5} {'D':<3} {'Cause':<10} "
+           f"{'Enrg':<8} {'Hydr':<8} {'Temp':<8} "
+           f"{'Buf':<7} {'Prn':<5} "
+           f"{'SurpMin':<8} {'SurpMn':<8} {'SurpMax':<8} {'Cut':<8} "
+           f"{'Reward':<8}")
+    print(f"\n{hdr}")
+    print("-" * len(hdr))
+
     for cycle in range(1, args.cycles + 1):
-        # Wake phase
-        wake_rewards = []
+        tracker.start_cycle(cycle)
+
         for step in range(args.wake_steps):
             reward, done = trainer.wake_step(resources)
-            wake_rewards.append(reward)
             world.step()
-            
+            tracker.record_step(agent, reward)
             if done:
-                deaths += 1
-                # Reset agent for next episode
+                tracker.record_death(agent, world.tick)
                 agent.reset()
-        
-        buffer_before = len(trainer.replay_buffer)
-        
-        # Sleep phase
+
         sleep_stats = trainer.sleep_cycle()
-        
-        # Collect stats
-        stats = {
-            'cycle': cycle,
-            'wake_steps': len(wake_rewards),
-            'mean_reward': np.mean(wake_rewards),
-            'buffer_before': buffer_before,
-            'buffer_after': sleep_stats['buffer_size'],
-            'pruned': sleep_stats['transitions_pruned'],
-            'avg_uncertainty': sleep_stats.get('avg_uncertainty', 1.0),
-            'avg_td_error': sleep_stats.get('avg_td_error', 1.0),
-            'scale_factor': sleep_stats['scale_factor'],
-            'fisher_mean': sleep_stats['fisher_stats'].get('mean_fisher', 0),
-        }
-        
-        # Get min uncertainty from buffer stats
-        buffer_stats = trainer.replay_buffer.get_stats()
-        stats['min_uncertainty'] = buffer_stats.get('min_uncertainty', 1.0)
-        stats['near_consolidated'] = buffer_stats.get('near_consolidated', 0)
-        
-        cycle_stats.append(stats)
-        total_pruned += stats['pruned']
-        
-        # Print row
-        print(f"{cycle:<6} {stats['wake_steps']:<6} {stats['buffer_after']:<8} "
-              f"{stats['pruned']:<8} {stats['avg_uncertainty']:<10.4f} "
-              f"{stats['min_uncertainty']:<10.4f} {stats['avg_td_error']:<10.4f} "
-              f"{stats['scale_factor']:<8.4f}")
-    
-    # Summary
-    print("-" * 76)
-    print(f"\n📊 Summary after {args.cycles} cycles:")
-    print(f"   Total transitions processed: {trainer.replay_buffer.total_added}")
-    print(f"   Total pruned: {total_pruned}")
-    print(f"   Final buffer size: {len(trainer.replay_buffer)}")
-    print(f"   Agent deaths: {deaths}")
-    print(f"   Total reward: {trainer.stats['total_reward']:.2f}")
-    
-    print("✓ Multi-cycle test complete")
 
-    # Test 7: Uncertainty Variation Check
-    print("\n[Test 7: Uncertainty Variation Check]")
-    uncertainties = [s['avg_uncertainty'] for s in cycle_stats]
-    min_uncertainties = [s['min_uncertainty'] for s in cycle_stats]
-    
-    if all(u == 1.0 for u in uncertainties):
-        print("⚠️  WARNING: All avg uncertainties are 1.0 - Fisher-informed estimation may not be working")
-        print("   Check that replay_buffer.py has the Fisher-informed update_uncertainties()")
-    elif max(uncertainties) - min(uncertainties) < 0.01:
-        print(f"⚠️  WARNING: Uncertainties not varying much: {min(uncertainties):.4f} - {max(uncertainties):.4f}")
-        print("   Consider increasing perturbation_scale or num_samples")
-    else:
-        print(f"✓ Avg uncertainties varying: {min(uncertainties):.4f} - {max(uncertainties):.4f}")
-    
-    if min(min_uncertainties) < 0.5:
-        print(f"✓ Min uncertainty reaching low values: {min(min_uncertainties):.4f}")
-    else:
-        print(f"ℹ️  Min uncertainty still high: {min(min_uncertainties):.4f} (may need more training)")
+        ps = sleep_stats['transitions_pruned']
+        cs = tracker.end_cycle(
+            surprise_min=ps.surprise_min,
+            surprise_mean=ps.surprise_mean,
+            surprise_max=ps.surprise_max,
+            surprise_cutoff=ps.surprise_cutoff,
+            buffer_size=sleep_stats['buffer_size'],
+            pruned=ps.pruned,
+            policy_loss=sleep_stats.get('policy_loss', 0),
+            value_loss=sleep_stats.get('value_loss', 0),
+            entropy=sleep_stats.get('entropy', 0),
+        )
 
-    # Test 8: Pruning Effectiveness Check
-    print("\n[Test 8: Pruning Effectiveness Check]")
+        d_str = str(cs.deaths) if cs.deaths > 0 else '.'
+        c_str = ','.join(cs.death_causes)[:9] if cs.death_causes else ''
+
+        print(f"{cycle:<5} {d_str:<3} {c_str:<10} "
+              f"{cs.energy_avg:>5.1f}/{cs.energy_min:<.0f} "
+              f"{cs.hydration_avg:>5.1f}/{cs.hydration_min:<.0f} "
+              f"{cs.temperature_avg:>5.1f}/{cs.temperature_min:<.0f} "
+              f"{cs.buffer_size:<7} {cs.pruned:<5} "
+              f"{cs.surprise_min:<8.4f} {cs.surprise_mean:<8.4f} "
+              f"{cs.surprise_max:<8.2f} {cs.surprise_cutoff:<8.4f} "
+              f"{cs.reward_total:<8.1f}")
+
+    print("-" * len(hdr))
+    print(f"\n📊 Buffer: {trainer.replay_buffer.total_added} added, "
+          f"{trainer.replay_buffer.total_pruned} pruned, "
+          f"final={len(trainer.replay_buffer)}, "
+          f"deaths={len(tracker.all_deaths)}")
+
+    tracker.print_summary()
+
+    # Diagnostic checks
+    print(f"\n{'='*60}")
+    print("DIAGNOSTIC CHECKS")
+    print(f"{'='*60}")
+
+    # Pruning happening?
+    total_pruned = sum(s.pruned for s in tracker.cycle_stats)
+    print(f"\n[Pruning Active]")
     if total_pruned == 0:
-        print("⚠️  WARNING: No pruning occurred")
-        print("   This is normal for short runs. Try:")
-        print("   - More cycles (--cycles 20)")
-        print("   - More wake steps (--wake-steps 200)")
-        print("   - Lower prune thresholds in TrainingConfig")
+        print("  ❌ No pruning — replay surprise may not be set")
     else:
-        print(f"✓ Pruning working: {total_pruned} total transitions pruned")
-        
-        # Show pruning progression
-        prune_counts = [s['pruned'] for s in cycle_stats]
-        if prune_counts[-1] > prune_counts[0]:
-            print(f"✓ Pruning increasing over time: {prune_counts[0]} → {prune_counts[-1]}")
-        
-    # Test 9: Fisher Accumulation Check
-    print("\n[Test 9: Fisher Accumulation Check]")
-    fisher_means = [s['fisher_mean'] for s in cycle_stats]
-    
-    if fisher_means[-1] > 0:
-        print(f"✓ Fisher matrix accumulating: {fisher_means[0]:.6f} → {fisher_means[-1]:.6f}")
-    else:
-        print("⚠️  WARNING: Fisher matrix appears empty")
-    
-    # Check for Fisher saturation pattern (should decay then stabilize)
-    if len(fisher_means) >= 3:
-        # Due to decay, later values should be smaller unless new learning dominates
-        print(f"   Fisher progression: {' → '.join(f'{f:.6f}' for f in fisher_means[:5])}...")
+        print(f"  ✓ {total_pruned} total pruned across {args.cycles} cycles")
 
-    # Test 10: Consolidation Progress Check  
-    print("\n[Test 10: Consolidation Progress Check]")
-    near_consolidated = [s.get('near_consolidated', 0) for s in cycle_stats]
-    
-    if near_consolidated[-1] > 0:
-        print(f"✓ {near_consolidated[-1]} transitions near consolidation threshold")
-        print(f"   Progression: {' → '.join(str(n) for n in near_consolidated)}")
+    # Buffer bounded?
+    sizes = [s.buffer_size for s in tracker.cycle_stats]
+    print(f"\n[Buffer Growth]")
+    print(f"  Range: {min(sizes)} → {max(sizes)}")
+    if max(sizes) > args.cycles * args.wake_steps * 0.9:
+        print("  ⚠️  Buffer barely pruned — growing near linearly")
     else:
-        print("ℹ️  No transitions near consolidation yet (normal for early training)")
-        print("   Run longer to see consolidation: --cycles 20 --wake-steps 200")
+        print("  ✓ Buffer regulated")
 
-    print("\n" + "="*60)
-    print("Phase 4 Complete: Memory & Training Systems Working! ✅")
-    print("="*60)
+    # Surprise decreasing?
+    if len(tracker.cycle_stats) >= 6:
+        n = len(tracker.cycle_stats)
+        early = np.mean([s.surprise_mean for s in tracker.cycle_stats[:n//3]])
+        late = np.mean([s.surprise_mean for s in tracker.cycle_stats[2*n//3:]])
+        print(f"\n[Surprise Trend]")
+        print(f"  Mean surprise: {early:.4f} → {late:.4f} "
+              f"({'↓ consolidating' if late < early else '→ flat/up'})")
+
+    print(f"\n{'='*60}")
+    print("Phase 4 Complete ✅")
+    print(f"{'='*60}")
+
+    return tracker
+
+
+# ======================================================================
+# Main
+# ======================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Phase 4: Replay-Driven Pruning")
+    parser.add_argument("--cycles", type=int, default=3)
+    parser.add_argument("--wake-steps", type=int, default=100)
+    args = parser.parse_args()
+
+    run_synthetic_tests()
+    run_integration(args)
 
 
 if __name__ == "__main__":

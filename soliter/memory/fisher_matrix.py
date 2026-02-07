@@ -1,23 +1,33 @@
 """
 Fisher Information Matrix for Elastic Weight Consolidation (EWC).
 
-Tracks which weights are important for previously learned tasks
-and penalizes changes to those weights.
+FIXED VERSION: 
+- Fisher now ACCUMULATES over sleep cycles instead of being overwritten.
+- get_ewc_loss() now accepts lambda_ewc parameter for proper scaling.
+
+Formula per sleep cycle:
+    1. Decay existing Fisher: F = decay * F
+    2. Compute new Fisher from current data: F_new
+    3. Accumulate: F = F + F_new
+
+EWC Loss Formula:
+    L_EWC = (λ/2) × Σ_i F_i × (θ_i - θ*_i)²
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
-import copy
+from typing import Dict, Optional, Iterable
 
 
 class FisherInformationMatrix:
     """
-    Computes and stores Fisher Information Matrix for EWC.
+    Computes and stores the diagonal Fisher Information Matrix.
     
-    The Fisher diagonal approximates the importance of each weight:
-    - High Fisher value = important for past tasks (should be preserved)
-    - Low Fisher value = less important (can be modified)
+    The Fisher Information approximates the curvature of the loss landscape,
+    indicating which parameters are important for previously learned tasks.
+    
+    For EWC, we use this to penalize changes to important parameters,
+    preventing catastrophic forgetting.
     """
     
     def __init__(
@@ -26,42 +36,48 @@ class FisherInformationMatrix:
         device: torch.device,
     ):
         self.device = device
+        self.model_param_names = [name for name, _ in model.named_parameters()]
         
-        # Store Fisher diagonal and optimal weights
+        # Initialize Fisher diagonal to zeros
         self.fisher_diagonal: Dict[str, torch.Tensor] = {}
-        self.optimal_weights: Dict[str, torch.Tensor] = {}
-        
-        # Initialize to zeros
-        self._initialize_fisher(model)
-    
-    def _initialize_fisher(self, model: nn.Module) -> None:
-        """Initialize Fisher diagonal to zeros."""
         for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.fisher_diagonal[name] = torch.zeros_like(param, device=self.device)
-                self.optimal_weights[name] = param.data.clone()
+            self.fisher_diagonal[name] = torch.zeros_like(param, device=device)
+        
+        # Store optimal weights (θ* in EWC formula)
+        self.optimal_weights: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            self.optimal_weights[name] = param.detach().clone().to(device)
+        
+        # Track computation history for debugging
+        self._compute_count = 0
+        self._last_computed_mean = 0.0
     
     def compute_fisher(
         self,
         model: nn.Module,
-        dataloader,
+        dataloader: Iterable,
         num_samples: int = 1000,
     ) -> None:
         """
-        Compute Fisher Information diagonal using sampled gradients.
+        Compute Fisher Information and ACCUMULATE with existing Fisher.
         
-        Fisher approximation: E[(∇log p(y|x))²]
+        Uses the empirical Fisher approximation:
+        F_ii = E[(∂L/∂θ_i)²]
+        
+        IMPORTANT: This ADDS to existing Fisher, not replaces!
+        Call decay_fisher() BEFORE this to prevent unbounded growth.
         
         Args:
-            model: Neural network
-            dataloader: Iterator of (state, action) pairs
+            model: The neural network
+            dataloader: Iterator yielding (state,) tuples
             num_samples: Number of samples to use
         """
         model.eval()
         
-        # Reset Fisher diagonal
-        for name in self.fisher_diagonal:
-            self.fisher_diagonal[name].zero_()
+        # Temporary storage for this computation
+        new_fisher: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            new_fisher[name] = torch.zeros_like(param, device=self.device)
         
         samples_processed = 0
         
@@ -72,85 +88,111 @@ class FisherInformationMatrix:
             states = batch[0].to(self.device)
             batch_size = states.shape[0]
             
-            # Reset hidden state to match batch size
+            # Reset hidden state for clean forward pass
             if hasattr(model, 'reset_hidden'):
-                hidden = model.reset_hidden(batch_size=batch_size, device=self.device)
-            else:
-                hidden = None
+                model.reset_hidden(batch_size=batch_size, device=self.device)
             
             # Forward pass
-            outputs, _ = model(states, hidden=hidden, return_hidden=True) if hidden is not None else model(states)
+            model.zero_grad()
+            output, _ = model(states)
             
-            # For each output dimension, compute gradient
-            for i in range(outputs.shape[1]):
-                model.zero_grad()
-                
-                # Gradient of output w.r.t. weights
-                outputs[:, i].sum().backward(retain_graph=(i < outputs.shape[1] - 1))
-                
-                # Accumulate squared gradients (Fisher diagonal)
-                for name, param in model.named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        self.fisher_diagonal[name] += param.grad.data ** 2
+            # Use output variance as proxy for log-likelihood
+            # (For policy networks, this approximates the Fisher)
+            loss = output.pow(2).mean()
+            loss.backward()
+            
+            # Accumulate squared gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    new_fisher[name] += param.grad.detach().pow(2) * batch_size
             
             samples_processed += batch_size
         
         # Normalize by number of samples
+        if samples_processed > 0:
+            for name in new_fisher:
+                new_fisher[name] /= samples_processed
+        
+        # ACCUMULATE: Add new Fisher to existing (decayed) Fisher
         for name in self.fisher_diagonal:
-            self.fisher_diagonal[name] /= samples_processed
+            self.fisher_diagonal[name] = self.fisher_diagonal[name] + new_fisher[name]
+        
+        # Track for debugging
+        self._compute_count += 1
+        all_new = torch.cat([f.flatten() for f in new_fisher.values()])
+        self._last_computed_mean = all_new.mean().item()
+        
+        # Reset hidden state after computation
+        if hasattr(model, 'reset_hidden'):
+            model.reset_hidden(batch_size=1, device=self.device)
+        
+        model.train()
+    
+    def decay_fisher(self, decay_factor: float = 0.9) -> None:
+        """
+        Apply exponential decay to Fisher values.
+        
+        This prevents Fisher from growing unboundedly and allows
+        the network to gradually "forget" very old task importance.
+        
+        CALL THIS BEFORE compute_fisher() each sleep cycle:
+            1. decay_fisher(0.77)  # Decay old importance
+            2. compute_fisher()    # Add new importance
+        
+        Args:
+            decay_factor: Multiply all Fisher values by this (0-1)
+        """
+        for name in self.fisher_diagonal:
+            self.fisher_diagonal[name] *= decay_factor
     
     def update_optimal_weights(self, model: nn.Module) -> None:
-        """Store current weights as optimal (after consolidation)."""
+        """
+        Update the optimal weights (θ*) to current model weights.
+        
+        Called after successful training/consolidation to mark
+        current weights as the "reference point" for EWC penalty.
+        """
         for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.optimal_weights[name] = param.data.clone()
-    
-    def decay_fisher(self, decay_rate: float = 0.77) -> None:
-        """
-        Decay Fisher values over time.
-        
-        This implements "Fisher saturation" - old tasks become less protected
-        to allow new learning.
-        
-        Args:
-            decay_rate: Multiplicative decay factor (0.77 from POC experiments)
-        """
-        for name in self.fisher_diagonal:
-            self.fisher_diagonal[name] *= decay_rate
+            self.optimal_weights[name] = param.detach().clone().to(self.device)
     
     def get_ewc_loss(
-        self,
-        model: nn.Module,
-        lambda_ewc: float = 155000.0,
+        self, 
+        model: nn.Module, 
+        lambda_ewc: float = 1.0,
     ) -> torch.Tensor:
         """
-        Compute EWC loss: λ/2 * Σ F_i * (θ_i - θ*_i)²
+        Compute the EWC penalty term.
+        
+        L_EWC = (λ/2) × Σ_i F_i × (θ_i - θ*_i)²
+        
+        This penalizes deviations from optimal weights, weighted
+        by parameter importance (Fisher) and scaled by lambda.
         
         Args:
-            model: Current model
-            lambda_ewc: EWC strength (155,000 from POC experiments)
-            
+            model: The neural network with current weights
+            lambda_ewc: EWC strength (typically 1000-500000)
+                       Higher = stronger protection against forgetting
+                       
         Returns:
-            EWC penalty loss
+            Scalar tensor representing EWC loss
         """
-        loss = torch.tensor(0.0, device=self.device)
+        ewc_loss = torch.tensor(0.0, device=self.device)
         
         for name, param in model.named_parameters():
-            if param.requires_grad and name in self.fisher_diagonal:
+            if name in self.fisher_diagonal and name in self.optimal_weights:
                 fisher = self.fisher_diagonal[name]
                 optimal = self.optimal_weights[name]
                 
-                # EWC penalty: F * (θ - θ*)²
-                loss += (fisher * (param - optimal) ** 2).sum()
+                # F_i * (θ_i - θ*_i)²
+                ewc_loss += (fisher * (param - optimal).pow(2)).sum()
         
-        return (lambda_ewc / 2) * loss
+        # Apply lambda scaling (λ/2 factor from original EWC paper)
+        ewc_loss = (lambda_ewc / 2.0) * ewc_loss
+        
+        return ewc_loss
     
-    def get_stats(self) -> Dict:
-        """Get Fisher statistics."""
-        if not self.fisher_diagonal:
-            return {}
-        
-        # Concatenate all Fisher values
+    def get_stats(self) -> Dict[str, float]:
+        """Get statistics about Fisher values for monitoring."""
         all_fisher = torch.cat([f.flatten() for f in self.fisher_diagonal.values()])
         
         return {
@@ -158,19 +200,19 @@ class FisherInformationMatrix:
             'max_fisher': all_fisher.max().item(),
             'min_fisher': all_fisher.min().item(),
             'std_fisher': all_fisher.std().item(),
-            'num_saturated': (all_fisher > 1000).sum().item(),  # High protection
-            'num_params': len(all_fisher),
+            'nonzero_ratio': (all_fisher > 1e-10).float().mean().item(),
+            'compute_count': self._compute_count,
+            'last_computed_mean': self._last_computed_mean,
         }
     
-    def save(self, path: str) -> None:
-        """Save Fisher matrix to file."""
-        torch.save({
-            'fisher_diagonal': self.fisher_diagonal,
-            'optimal_weights': self.optimal_weights,
-        }, path)
-    
-    def load(self, path: str) -> None:
-        """Load Fisher matrix from file."""
-        checkpoint = torch.load(path)
-        self.fisher_diagonal = checkpoint['fisher_diagonal']
-        self.optimal_weights = checkpoint['optimal_weights']
+    def get_importance_ranking(self, top_k: int = 10) -> Dict[str, float]:
+        """Get the most important parameters by Fisher value."""
+        importance = {}
+        for name, fisher in self.fisher_diagonal.items():
+            importance[name] = fisher.mean().item()
+        
+        # Sort by importance
+        sorted_importance = dict(
+            sorted(importance.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        )
+        return sorted_importance

@@ -1,396 +1,267 @@
 """
-Replay Buffer with Epistemic Pruning.
+Replay Buffer with Replay-Driven Pruning.
 
-The buffer stores recent experiences and prunes them based on:
-1. Epistemic uncertainty (model confidence)
-2. TD-error (prediction accuracy)
+Biological model (SHY + CLS):
+    During NREM sleep the hippocampus replays memories to the neocortex.
+    Memories that the cortex already "knows" (low replay surprise) have
+    been consolidated — their hippocampal trace fades.  Memories that
+    still surprise the cortex need further replay and are retained.
 
-Experiences are removed when the model has "consolidated" them into weights.
+Implementation:
+    During consolidation replay the trainer scores every transition by
+    "replay surprise" — how wrong the current network is about that
+    memory.  After replay, the buffer prunes the LEAST surprising
+    memories (bottom percentile).  No fixed thresholds, no gates —
+    pruning is a ranking problem, not a classification problem.
+
+    The amount of information lost is naturally small: early in training
+    even the bottom 20% are surprising (little is truly redundant).
+    Late in training most memories are redundant and the bottom 20%
+    safely reclaims space.
+
+Author: Stan (Project Soliter)
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import List, Tuple, Optional, Dict, TYPE_CHECKING
-from dataclasses import dataclass
+from typing import List, Optional, Dict, Tuple, Generator
+from dataclasses import dataclass, field
 import random
-import copy
+import logging
 
-if TYPE_CHECKING:
-    from ..memory.fisher_matrix import FisherInformationMatrix
+logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Transition:
-    """Single experience transition."""
-    state: torch.Tensor  # Sensor readings
-    action: torch.Tensor  # Motor outputs
-    reward: float  # Survival reward
+    """Single experience transition with replay metadata."""
+    state: torch.Tensor
+    action: torch.Tensor
+    reward: float
     next_state: torch.Tensor
     done: bool
-    
-    # Metadata
-    tick: int = 0
-    uncertainty: float = 1.0  # Epistemic uncertainty (1.0 = maximum uncertainty)
-    td_error: float = 1.0  # TD-error
+
+    # Metadata (set during wake, updated during sleep replay)
+    tick: int = 0                       # World tick when recorded
+    replay_surprise: float = 1.0        # How surprising during last replay [0, inf)
+                                        # High = cortex doesn't know this yet
+                                        # Low  = cortex has consolidated this
+
+    # Legacy fields kept for backward compat / monitoring
+    uncertainty: float = 1.0
+    td_error: float = 1.0
+    fisher_protection: float = 0.0
 
 
-class ReplayBuffer:
+@dataclass
+class PruningStats:
+    """Statistics from a single replay-driven pruning operation."""
+    buffer_before: int = 0
+    buffer_after: int = 0
+    pruned: int = 0
+    surprise_min: float = 0.0           # Lowest surprise (most consolidated)
+    surprise_max: float = 0.0           # Highest surprise (least consolidated)
+    surprise_mean: float = 0.0          # Mean surprise across buffer
+    surprise_cutoff: float = 0.0        # Surprise of last-pruned transition
+    consolidation_loss: float = 0.0     # Total surprise of pruned batch
+
+    # Legacy fields for backward compat with test_phase4
+    candidates: int = 0
+    fisher_gated_out: int = 0
+    rate_limited: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Main buffer
+# ---------------------------------------------------------------------------
+
+class EpistemicReplayBuffer:
     """
-    Experience replay buffer with epistemic pruning.
-    
-    Unlike standard FIFO buffers, this prunes based on consolidation:
-    - Keep experiences with high uncertainty (not yet learned)
-    - Remove experiences with low uncertainty + low TD-error (consolidated)
-    
-    Uncertainty Estimation Strategy:
-    --------------------------------
-    Since CfC networks don't have dropout, we use Fisher-informed weight
-    perturbation. The Fisher Information Matrix tells us which weights are
-    important (high Fisher) vs unimportant (low Fisher).
-    
-    A consolidated memory should be ROBUST to perturbations of low-Fisher
-    weights (the unimportant ones). If perturbing unimportant weights 
-    changes the output significantly, the memory is NOT well consolidated.
-    
-    This is more principled than random noise because:
-    1. It directly uses the same importance measure as EWC
-    2. It tests if the memory relies on stable (high-Fisher) pathways
-    3. It aligns with the biological intuition of synaptic consolidation
+    Experience replay buffer with replay-driven pruning.
+
+    Pruning is a two-step process that happens during sleep:
+
+    1. **Score** — The trainer replays every memory through the current
+       network.  Each transition gets a `replay_surprise` score based on
+       how wrong the network's predictions are (action error + value error).
+
+    2. **Prune** — The buffer removes the bottom `prune_fraction` of
+       transitions ranked by replay surprise.  These are the memories
+       the cortex has already absorbed.
+
+    No fixed thresholds.  No gates.  The pruning decision emerges from
+    the replay itself — exactly as in biological sleep.
+
+    Parameters:
+        capacity:        Hard upper bound on buffer size.
+        prune_fraction:  Fraction of buffer to prune each sleep cycle
+                         (default 0.2 = bottom 20% by replay surprise).
+        min_buffer_size: Absolute minimum — never prune below this.
+                         Small (default 64 = one batch) to avoid the
+                         artificial-floor problem, but prevents total
+                         buffer death if surprise collapses to zero.
     """
-    
+
     def __init__(
         self,
         capacity: int = 1_000_000,
+        prune_fraction: float = 0.2,
+        min_buffer_size: int = 64,
+        # Legacy params accepted but ignored (backward compat)
         prune_threshold_uncertainty: float = 0.1,
         prune_threshold_td_error: float = 0.05,
+        prune_threshold_fisher: float = 0.01,
+        max_prune_fraction: float = 0.30,
     ):
         self.capacity = capacity
-        self.prune_threshold_uncertainty = prune_threshold_uncertainty
-        self.prune_threshold_td_error = prune_threshold_td_error
-        
+        self.prune_fraction = prune_fraction
+        self.min_buffer_size = min_buffer_size
+
         self.buffer: List[Transition] = []
         self.position = 0
-        
-        # Statistics
+
+        # Lifetime statistics
         self.total_added = 0
         self.total_pruned = 0
-    
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+
     def push(self, transition: Transition) -> None:
-        """Add transition to buffer."""
+        """Add a transition to the buffer."""
         if len(self.buffer) < self.capacity:
             self.buffer.append(transition)
         else:
-            # Circular buffer: overwrite oldest
             self.buffer[self.position] = transition
-        
         self.position = (self.position + 1) % self.capacity
         self.total_added += 1
-    
+
     def sample(self, batch_size: int) -> List[Transition]:
-        """Sample random batch from buffer."""
+        """Uniformly sample a batch from the buffer."""
         return random.sample(self.buffer, min(batch_size, len(self.buffer)))
-    
-    def update_uncertainties(
-        self,
-        model: nn.Module,
-        num_samples: int = 10,
-        fisher_matrix: Optional['FisherInformationMatrix'] = None,
-        perturbation_scale: float = 0.1,
-    ) -> None:
+
+    def iter_batches(
+        self, batch_size: int
+    ) -> Generator[Tuple[List[Transition], List[int]], None, None]:
         """
-        Update epistemic uncertainty using Fisher-informed weight perturbation.
-        
-        Strategy: Perturb LOW-Fisher weights (unimportant ones) and measure
-        output variance. Well-consolidated memories are robust to these 
-        perturbations; uncertain memories are sensitive.
-        
-        Args:
-            model: The neural network (CfC)
-            num_samples: Number of forward passes with perturbed weights
-            fisher_matrix: Fisher Information Matrix (if None, falls back to random)
-            perturbation_scale: Scale of perturbation for low-Fisher weights
+        Iterate over the ENTIRE buffer in batches.
+
+        Yields (batch_transitions, batch_indices) tuples.
+        Used during consolidation replay so every memory is scored.
         """
-        model.eval()
-        device = next(model.parameters()).device
-        
-        # Get original weights
-        original_state = copy.deepcopy(model.state_dict())
-        
-        # Compute Fisher-based masks if available
-        if fisher_matrix is not None and fisher_matrix.fisher_diagonal:
-            perturbation_masks = self._compute_fisher_masks(
-                model, fisher_matrix, perturbation_scale
-            )
-        else:
-            perturbation_masks = None
-        
-        for transition in self.buffer:
-            state = transition.state.unsqueeze(0).to(device)
-            
-            predictions = []
-            with torch.no_grad():
-                for sample_idx in range(num_samples):
-                    # Apply Fisher-informed perturbation to weights
-                    if perturbation_masks is not None:
-                        self._apply_perturbation(model, perturbation_masks)
-                    else:
-                        # Fallback: perturb all weights slightly
-                        self._apply_random_perturbation(model, perturbation_scale)
-                    
-                    # Reset hidden state for clean forward pass
-                    if hasattr(model, 'reset_hidden'):
-                        hidden = model.reset_hidden(batch_size=1, device=device)
-                    else:
-                        hidden = None
-                    
-                    output, _ = model(state, hidden=hidden, return_hidden=True)
-                    predictions.append(output.clone())
-                    
-                    # Restore original weights
-                    model.load_state_dict(original_state)
-            
-            # Calculate variance across predictions
-            predictions = torch.stack(predictions)
-            variance = predictions.var(dim=0).mean().item()
-            
-            # Normalize to [0, 1] range
-            # Higher variance = higher uncertainty
-            transition.uncertainty = min(1.0, variance / (variance + 0.01))
-        
-        # Ensure original weights are restored
-        model.load_state_dict(original_state)
-    
-    def _compute_fisher_masks(
-        self,
-        model: nn.Module,
-        fisher_matrix: 'FisherInformationMatrix',
-        perturbation_scale: float,
-    ) -> Dict[str, torch.Tensor]:
+        indices = list(range(len(self.buffer)))
+        for start in range(0, len(indices), batch_size):
+            end = min(start + batch_size, len(indices))
+            batch_idx = indices[start:end]
+            batch_transitions = [self.buffer[i] for i in batch_idx]
+            yield batch_transitions, batch_idx
+
+    # ------------------------------------------------------------------
+    # Replay-driven pruning
+    # ------------------------------------------------------------------
+
+    def prune_by_surprise(self) -> PruningStats:
         """
-        Compute perturbation masks based on Fisher Information.
-        
-        Low-Fisher weights get larger perturbations (they're "weak"/unimportant).
-        High-Fisher weights get smaller perturbations (they're "strong"/important).
-        
+        Remove the least-surprising memories from the buffer.
+
+        Call this AFTER the trainer has set `replay_surprise` on every
+        transition via the consolidated replay pass.
+
+        Strategy: sort by replay_surprise ascending, prune the bottom
+        `prune_fraction`.  These are the memories the network has
+        already absorbed — the cortex "dreamed" them and wasn't
+        surprised, so the hippocampal trace fades.
+
         Returns:
-            Dictionary mapping parameter names to perturbation standard deviations
+            PruningStats with full diagnostics.
         """
-        masks = {}
-        
-        for name, param in model.named_parameters():
-            if name in fisher_matrix.fisher_diagonal:
-                fisher = fisher_matrix.fisher_diagonal[name]
-                
-                # Inverse Fisher scaling: low Fisher → high perturbation
-                # Add small epsilon to avoid division by zero
-                # Normalize Fisher values to [0, 1] range first
-                fisher_normalized = fisher / (fisher.max() + 1e-8)
-                
-                # Perturbation scale: high for low-Fisher, low for high-Fisher
-                # Scale = perturbation_scale * (1 - normalized_fisher)
-                perturbation_std = perturbation_scale * (1.0 - fisher_normalized)
-                
-                masks[name] = perturbation_std
-            else:
-                # No Fisher info: use uniform perturbation
-                masks[name] = torch.full_like(param, perturbation_scale)
-        
-        return masks
-    
-    def _apply_perturbation(
-        self,
-        model: nn.Module,
-        perturbation_masks: Dict[str, torch.Tensor],
-    ) -> None:
-        """Apply Fisher-informed perturbations to model weights."""
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                if name in perturbation_masks:
-                    noise = torch.randn_like(param) * perturbation_masks[name]
-                    param.add_(noise)
-    
-    def _apply_random_perturbation(
-        self,
-        model: nn.Module,
-        scale: float,
-    ) -> None:
-        """Apply uniform random perturbations (fallback when no Fisher available)."""
-        with torch.no_grad():
-            for param in model.parameters():
-                noise = torch.randn_like(param) * scale
-                param.add_(noise)
-    
-    def update_uncertainties_batch(
-        self,
-        model: nn.Module,
-        batch_size: int = 64,
-        num_samples: int = 10,
-        fisher_matrix: Optional['FisherInformationMatrix'] = None,
-        perturbation_scale: float = 0.1,
-    ) -> None:
-        """
-        Batch version of update_uncertainties for efficiency.
-        
-        Args:
-            model: The neural network (CfC)
-            batch_size: Number of transitions to process at once
-            num_samples: Number of forward passes with perturbed weights
-            fisher_matrix: Fisher Information Matrix
-            perturbation_scale: Scale of perturbation for low-Fisher weights
-        """
-        model.eval()
-        device = next(model.parameters()).device
-        
-        original_state = copy.deepcopy(model.state_dict())
-        
-        if fisher_matrix is not None and fisher_matrix.fisher_diagonal:
-            perturbation_masks = self._compute_fisher_masks(
-                model, fisher_matrix, perturbation_scale
-            )
-        else:
-            perturbation_masks = None
-        
-        for batch_start in range(0, len(self.buffer), batch_size):
-            batch_end = min(batch_start + batch_size, len(self.buffer))
-            batch_transitions = self.buffer[batch_start:batch_end]
-            current_batch_size = len(batch_transitions)
-            
-            states = torch.stack([t.state for t in batch_transitions]).to(device)
-            
-            all_predictions = []
-            with torch.no_grad():
-                for _ in range(num_samples):
-                    if perturbation_masks is not None:
-                        self._apply_perturbation(model, perturbation_masks)
-                    else:
-                        self._apply_random_perturbation(model, perturbation_scale)
-                    
-                    if hasattr(model, 'reset_hidden'):
-                        hidden = model.reset_hidden(batch_size=current_batch_size, device=device)
-                    else:
-                        hidden = None
-                    
-                    output, _ = model(states, hidden=hidden, return_hidden=True)
-                    all_predictions.append(output.clone())
-                    
-                    model.load_state_dict(original_state)
-            
-            predictions = torch.stack(all_predictions)
-            variances = predictions.var(dim=0)
-            mean_variances = variances.mean(dim=-1)
-            
-            for i, transition in enumerate(batch_transitions):
-                var = mean_variances[i].item()
-                transition.uncertainty = min(1.0, var / (var + 0.01))
-        
-        model.load_state_dict(original_state)
-    
-    def update_td_errors(
-        self,
-        model: nn.Module,
-        gamma: float = 0.99,
-    ) -> None:
-        """
-        Update TD-errors for all transitions.
-        
-        TD-error = |r + γ·V(s') - V(s)|
-        
-        For simplicity, we use action magnitude as proxy for value.
-        """
-        model.eval()
-        device = next(model.parameters()).device
-        
-        for transition in self.buffer:
-            if transition.done:
-                td_error = abs(transition.reward)
-            else:
-                with torch.no_grad():
-                    if hasattr(model, 'reset_hidden'):
-                        hidden = model.reset_hidden(batch_size=1, device=device)
-                    else:
-                        hidden = None
-                    
-                    state = transition.state.unsqueeze(0).to(device)
-                    next_state = transition.next_state.unsqueeze(0).to(device)
-                    
-                    state_output, new_hidden = model(state, hidden=hidden, return_hidden=True)
-                    next_state_output, _ = model(next_state, hidden=new_hidden, return_hidden=True)
-                    
-                    state_value = -state_output[0, 0].item()
-                    next_state_value = -next_state_output[0, 0].item()
-                    
-                    td_error = abs(transition.reward + gamma * next_state_value - state_value)
-            
-            transition.td_error = td_error
-    
-    def update_td_errors_batch(
-        self,
-        model: nn.Module,
-        batch_size: int = 64,
-        gamma: float = 0.99,
-    ) -> None:
-        """Batch version of update_td_errors for efficiency."""
-        model.eval()
-        device = next(model.parameters()).device
-        
-        for batch_start in range(0, len(self.buffer), batch_size):
-            batch_end = min(batch_start + batch_size, len(self.buffer))
-            batch_transitions = self.buffer[batch_start:batch_end]
-            current_batch_size = len(batch_transitions)
-            
-            states = torch.stack([t.state for t in batch_transitions]).to(device)
-            next_states = torch.stack([t.next_state for t in batch_transitions]).to(device)
-            rewards = torch.tensor([t.reward for t in batch_transitions], device=device)
-            dones = torch.tensor([t.done for t in batch_transitions], device=device)
-            
-            with torch.no_grad():
-                if hasattr(model, 'reset_hidden'):
-                    hidden = model.reset_hidden(batch_size=current_batch_size, device=device)
-                else:
-                    hidden = None
-                
-                state_outputs, new_hidden = model(states, hidden=hidden, return_hidden=True)
-                next_state_outputs, _ = model(next_states, hidden=new_hidden, return_hidden=True)
-                
-                state_values = -state_outputs[:, 0]
-                next_state_values = -next_state_outputs[:, 0]
-                
-                td_errors = torch.abs(rewards + gamma * next_state_values * (~dones) - state_values)
-            
-            for i, transition in enumerate(batch_transitions):
-                transition.td_error = td_errors[i].item()
-    
-    def prune_consolidated(self, max_prune: int = None) -> int:
-        """Remove consolidated transitions."""
-        to_remove = []
-        for i, t in enumerate(self.buffer):
-            if t.uncertainty < self.prune_threshold_uncertainty and \
-            t.td_error < self.prune_threshold_td_error:
-                to_remove.append(i)
-        
-        # Respect max_prune limit
-        if max_prune is not None and len(to_remove) > max_prune:
-            # Keep only the most consolidated (lowest uncertainty)
-            to_remove = sorted(to_remove, key=lambda i: self.buffer[i].uncertainty)[:max_prune]
-        
-        # Remove in reverse order to preserve indices
-        for i in sorted(to_remove, reverse=True):
-            self.buffer.pop(i)
-            self.total_pruned += 1
-        
-        return len(to_remove)
-    
-    def get_consolidation_candidates(self) -> List[Transition]:
-        """Get transitions that are close to being consolidated (for debugging)."""
-        return [
-            t for t in self.buffer
-            if t.uncertainty < self.prune_threshold_uncertainty * 2 or
-               t.td_error < self.prune_threshold_td_error * 2
+        stats = PruningStats(buffer_before=len(self.buffer))
+
+        if len(self.buffer) <= self.min_buffer_size:
+            stats.buffer_after = len(self.buffer)
+            return stats
+
+        # Gather surprise scores
+        surprises = [t.replay_surprise for t in self.buffer]
+        stats.surprise_min = min(surprises)
+        stats.surprise_max = max(surprises)
+        stats.surprise_mean = float(np.mean(surprises))
+
+        # How many to prune?
+        n_prune = int(len(self.buffer) * self.prune_fraction)
+
+        # Respect absolute floor
+        n_prune = min(n_prune, len(self.buffer) - self.min_buffer_size)
+        n_prune = max(n_prune, 0)
+
+        if n_prune == 0:
+            stats.buffer_after = len(self.buffer)
+            return stats
+
+        # Rank by surprise: lowest first (most consolidated)
+        ranked = sorted(
+            range(len(self.buffer)),
+            key=lambda i: self.buffer[i].replay_surprise,
+        )
+
+        # Prune the bottom n_prune
+        prune_set = set(ranked[:n_prune])
+        stats.surprise_cutoff = self.buffer[ranked[n_prune - 1]].replay_surprise
+
+        # Diagnostic: total surprise lost
+        pruned_surprises = [self.buffer[i].replay_surprise for i in prune_set]
+        stats.consolidation_loss = float(np.sum(pruned_surprises))
+
+        # Remove (rebuild without pruned indices)
+        self.buffer = [
+            t for i, t in enumerate(self.buffer)
+            if i not in prune_set
         ]
-    
+
+        stats.pruned = n_prune
+        stats.buffer_after = len(self.buffer)
+        stats.candidates = len(surprises)  # Legacy compat
+        self.total_pruned += n_prune
+
+        # Reset circular position
+        self.position = len(self.buffer) % self.capacity
+
+        logger.info(
+            f"Replay pruning: {stats.buffer_before} -> {stats.buffer_after} "
+            f"(pruned {stats.pruned}, cutoff={stats.surprise_cutoff:.4f}, "
+            f"mean={stats.surprise_mean:.4f})"
+        )
+
+        return stats
+
+    # ------------------------------------------------------------------
+    # Legacy API (backward compat — test_phase4, old trainer)
+    # ------------------------------------------------------------------
+
+    def prune_consolidated(self, **kwargs) -> PruningStats:
+        """Legacy entry point — redirects to prune_by_surprise."""
+        return self.prune_by_surprise()
+
+    def update_uncertainties(self, *args, **kwargs) -> None:
+        """Legacy no-op. Uncertainty is now computed during replay."""
+        pass
+
+    def update_td_errors(self, *args, **kwargs) -> None:
+        """Legacy no-op. TD errors are now computed during replay."""
+        pass
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+
     def get_stats(self) -> Dict:
-        """Get buffer statistics."""
+        """Get comprehensive buffer statistics."""
         if len(self.buffer) == 0:
             return {
                 'size': 0,
@@ -399,34 +270,39 @@ class ReplayBuffer:
                 'total_added': self.total_added,
                 'total_pruned': self.total_pruned,
             }
-        
-        uncertainties = [t.uncertainty for t in self.buffer]
-        td_errors = [t.td_error for t in self.buffer]
-        
-        near_consolidated = sum(
-            1 for t in self.buffer
-            if t.uncertainty < self.prune_threshold_uncertainty * 2 and
-               t.td_error < self.prune_threshold_td_error * 2
-        )
-        
+
+        surprises = [t.replay_surprise for t in self.buffer]
+        rewards = [t.reward for t in self.buffer]
+
         return {
             'size': len(self.buffer),
             'capacity': self.capacity,
             'utilization': len(self.buffer) / self.capacity,
             'total_added': self.total_added,
             'total_pruned': self.total_pruned,
-            'avg_uncertainty': float(np.mean(uncertainties)),
-            'avg_td_error': float(np.mean(td_errors)),
-            'min_uncertainty': float(np.min(uncertainties)),
-            'max_uncertainty': float(np.max(uncertainties)),
-            'min_td_error': float(np.min(td_errors)),
-            'max_td_error': float(np.max(td_errors)),
-            'near_consolidated': near_consolidated,
+            # Replay surprise distribution
+            'avg_surprise': float(np.mean(surprises)),
+            'min_surprise': float(np.min(surprises)),
+            'max_surprise': float(np.max(surprises)),
+            'median_surprise': float(np.median(surprises)),
+            'std_surprise': float(np.std(surprises)),
+            # Reward distribution in buffer
+            'avg_reward': float(np.mean(rewards)),
+            'min_reward': float(np.min(rewards)),
+            'max_reward': float(np.max(rewards)),
+            # Legacy keys (consumed by test_phase4 / trainer)
+            'avg_uncertainty': float(np.mean(surprises)),
+            'avg_td_error': float(np.mean(surprises)),
+            'avg_fisher_protection': 0.0,
+            'near_consolidated': sum(1 for s in surprises if s < np.median(surprises)),
+            'gate1_uncertainty_pass': 0,
+            'gate12_unc_td_pass': 0,
+            'gate123_fully_consolidated': 0,
         }
-    
+
     def __len__(self) -> int:
         return len(self.buffer)
-    
+
     def clear(self) -> None:
         """Clear the buffer."""
         self.buffer.clear()

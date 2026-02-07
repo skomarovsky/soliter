@@ -21,7 +21,7 @@ from pathlib import Path
 from ..core.cfc_network import CfCBrain
 from ..agents.soliter_agent import SoliterAgent
 from ..environment import World, SensorSystem, Physics
-from ..memory.replay_buffer import ReplayBuffer, Transition
+from ..memory.replay_buffer import EpistemicReplayBuffer, Transition, PruningStats
 from ..memory.fisher_matrix import FisherInformationMatrix
 from .ewc import EWCLoss
 
@@ -71,15 +71,15 @@ class TrainingConfig:
     lambda_ewc: float = 155000.0
     fisher_decay: float = 0.77
     
-    # Buffer
+    # Buffer & pruning
     buffer_capacity: int = 1_000_000
-    prune_uncertainty_threshold: float = 0.3  # Stricter - only prune truly consolidated
-    prune_td_threshold: float = 0.5  # Stricter - must predict well
-    min_buffer_size: int = 1000  # NEVER prune below this - prevents collapse
+    prune_fraction: float = 0.2  # Prune bottom 20% by replay surprise each sleep
+    min_buffer_size: int = 64  # Absolute floor (one batch)
     
-    # Uncertainty estimation
-    uncertainty_num_samples: int = 10
-    uncertainty_perturbation_scale: float = 0.1
+    # Wake-time surprise gating (Titans-inspired)
+    surprise_gating: bool = True  # Enable wake-time filtering
+    surprise_momentum: float = 0.95  # S_t = θ·S_{t-1} + (1-θ)·surprise_t
+    surprise_percentile: float = 0.3  # Only store top 70% by surprise
     
     # Exploration
     action_std_init: float = 0.5  # Initial action standard deviation
@@ -217,10 +217,10 @@ class SleepWakeTrainer:
         )
         
         # Initialize memory systems
-        self.replay_buffer = ReplayBuffer(
+        self.replay_buffer = EpistemicReplayBuffer(
             capacity=self.config.buffer_capacity,
-            prune_threshold_uncertainty=self.config.prune_uncertainty_threshold,
-            prune_threshold_td_error=self.config.prune_td_threshold,
+            prune_fraction=self.config.prune_fraction,
+            min_buffer_size=self.config.min_buffer_size,
         )
         
         self.ppo_memory = PPOMemory()
@@ -263,6 +263,14 @@ class SleepWakeTrainer:
         self.reward_mean = 0.0
         self.reward_std = 1.0
         self.reward_count = 0
+        
+        # Wake-time surprise gating (Titans-inspired)
+        # Running surprise with momentum: S_t = θ·S_{t-1} + (1-θ)·s_t
+        self.running_surprise = 0.0
+        # Adaptive threshold: percentile of recent surprise distribution
+        self._surprise_history: List[float] = []
+        self._surprise_threshold = 0.0  # Updated periodically
+        self.total_gated_out = 0  # Transitions filtered by surprise gate
     
     def _get_action_distribution(
         self, 
@@ -275,14 +283,15 @@ class SleepWakeTrainer:
     def _select_action_with_exploration(
         self, 
         state: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Select action with exploration noise.
         
         Returns:
-            action: Sampled action
+            action: Sampled action (motor-constrained)
             log_prob: Log probability of action
             value: State value estimate
+            mean_action: Raw policy mean (for surprise computation)
         """
         with torch.no_grad():
             # Get mean action from policy
@@ -307,7 +316,7 @@ class SleepWakeTrainer:
                 torch.sigmoid(action[2]),  # sleep [0, 1]
             ])
         
-        return action_constrained, log_prob, value
+        return action_constrained, log_prob, value, mean_action
     
     def _compute_gae(
         self,
@@ -382,7 +391,7 @@ class SleepWakeTrainer:
         ).to(self.device)
         
         # Select action with exploration
-        action, log_prob, value = self._select_action_with_exploration(sensors)
+        action, log_prob, value, mean_action = self._select_action_with_exploration(sensors)
         
         velocity = action[0].item()
         turn = action[1].item()
@@ -435,7 +444,7 @@ class SleepWakeTrainer:
             next_state=next_sensors,
         )
         
-        # Store in replay buffer (for Fisher/uncertainty)
+        # Store in replay buffer — with wake-time surprise gating
         transition = Transition(
             state=sensors,
             action=action,
@@ -444,7 +453,43 @@ class SleepWakeTrainer:
             done=done,
             tick=self.world.tick,
         )
-        self.replay_buffer.push(transition)
+        
+        if self.config.surprise_gating:
+            # Compute instantaneous surprise: how different is current
+            # policy output from the action we actually took?
+            # (Same signal as sleep replay surprise, but cheaper — no value head)
+            with torch.no_grad():
+                instant_surprise = float((mean_action - action).pow(2).sum().item())
+            
+            # Update running surprise with momentum (Titans S_t formula)
+            theta = self.config.surprise_momentum
+            self.running_surprise = theta * self.running_surprise + (1 - theta) * instant_surprise
+            
+            # Track history for adaptive threshold
+            self._surprise_history.append(self.running_surprise)
+            
+            # Update threshold every 100 steps
+            if len(self._surprise_history) >= 100:
+                sorted_hist = sorted(self._surprise_history)
+                pct_idx = int(len(sorted_hist) * self.config.surprise_percentile)
+                self._surprise_threshold = sorted_hist[pct_idx]
+                self._surprise_history = self._surprise_history[-500:]  # Keep recent
+            
+            # Gate: only store if surprising enough (or if buffer is too small)
+            store = (
+                self.running_surprise >= self._surprise_threshold
+                or done  # Always store death transitions
+                or len(self.replay_buffer) < self.config.batch_size * 4  # Bootstrap
+            )
+            
+            if store:
+                transition.replay_surprise = self.running_surprise
+                self.replay_buffer.push(transition)
+            else:
+                self.total_gated_out += 1
+        else:
+            # No gating — store everything (legacy behavior)
+            self.replay_buffer.push(transition)
         
         self.total_wake_ticks += 1
         self.stats['total_reward'] += reward
@@ -633,54 +678,50 @@ class SleepWakeTrainer:
         """
         Execute one complete sleep cycle.
         
+        Biological analogy:
+            1. PPO update    — waking reflection on recent experience
+            2. Replay + Score — NREM: dream through ALL memories, score by surprise
+            3. Prune          — Least-surprising memories fade (hippocampal trace release)
+            4. Fisher update  — Consolidate which weights matter
+            5. Scaling         — REM: homeostatic synaptic downscaling
+            6. Exploration     — Adjust action noise
+        
         Returns:
             Statistics from sleep cycle
         """
         print(f"\n💤 Entering Sleep at tick {self.world.tick}")
         
-        # Step 0: PPO Update (learn from wake phase experiences)
+        # Step 0: PPO Update (learn from wake phase trajectory)
         print("  [Learning] PPO policy update...")
         ppo_stats = self._ppo_update()
         
-        # Step 1: Consolidation (NREM) - additional replay
-        print("  [NREM] Consolidating memories...")
-        for epoch in range(self.config.sleep_epochs):
-            if len(self.replay_buffer) >= self.config.batch_size:
-                self._consolidation_replay()
+        # Step 1: NREM — Replay ALL memories, score by surprise, consolidate
+        print("  [NREM] Replay-driven consolidation...")
+        replay_stats = self._replay_score_and_consolidate()
         
-        # Step 2: Update Fisher matrix
-        print("  [Computing Fisher Information...]")
+        # Step 2: Prune — Remove least-surprising memories
+        print("  [Pruning] Removing consolidated memories...")
+        pruning_stats = self.replay_buffer.prune_by_surprise()
+        pruned = pruning_stats.pruned
+        
+        # Step 3: Update Fisher matrix
+        print("  [Fisher] Decaying old Fisher information...")
+        self.fisher_matrix.decay_fisher(self.config.fisher_decay)
+        
+        print("  [Fisher] Computing new Fisher information...")
         self._update_fisher_matrix()
         
-        # Step 3: Homeostatic Synaptic Scaling (REM)
+        # Step 4: Homeostatic Synaptic Scaling (REM)
         print("  [REM] Applying homeostatic scaling...")
         scale_factor = self.agent.brain.apply_homeostatic_scaling(
             target_activity=self.config.target_activity,
             scaling_rate=self.config.scaling_rate,
         )
         
-        # Step 4: Epistemic Pruning with Fisher-informed uncertainty
-        print("  [Pruning] Computing Fisher-informed uncertainties...")
-        self.replay_buffer.update_uncertainties(
-            self.agent.brain,
-            num_samples=self.config.uncertainty_num_samples,
-            fisher_matrix=self.fisher_matrix,
-            perturbation_scale=self.config.uncertainty_perturbation_scale,
-        )
-        self.replay_buffer.update_td_errors(self.agent.brain)
-        
-        print("  [Pruning] Removing consolidated memories...")
-        # Protect against over-pruning - keep minimum buffer size
-        max_to_prune = max(0, len(self.replay_buffer) - self.config.min_buffer_size)
-        pruned = self.replay_buffer.prune_consolidated(max_prune=max_to_prune)
-        
-        # Step 5: Fisher decay
-        self.fisher_matrix.decay_fisher(self.config.fisher_decay)
-        
-        # Step 6: Update optimal weights
+        # Step 5: Update optimal weights (reference point for EWC)
         self.fisher_matrix.update_optimal_weights(self.agent.brain)
         
-        # Step 7: Decay exploration (anneal action std)
+        # Step 6: Decay exploration (anneal action std)
         with torch.no_grad():
             self.action_log_std.data = torch.clamp(
                 self.action_log_std.data - np.log(1 / self.config.action_std_decay),
@@ -698,16 +739,20 @@ class SleepWakeTrainer:
         
         stats = {
             'scale_factor': scale_factor,
-            'transitions_pruned': pruned,
+            'transitions_pruned': pruning_stats,
             'buffer_size': len(self.replay_buffer),
             'fisher_stats': self.fisher_matrix.get_stats(),
-            'avg_uncertainty': buffer_stats.get('avg_uncertainty', 1.0),
-            'avg_td_error': buffer_stats.get('avg_td_error', 1.0),
-            'near_consolidated': buffer_stats.get('near_consolidated', 0),
+            'avg_surprise': buffer_stats.get('avg_surprise', 1.0),
+            'median_surprise': buffer_stats.get('median_surprise', 1.0),
             'policy_loss': ppo_stats['policy_loss'],
             'value_loss': ppo_stats['value_loss'],
             'entropy': ppo_stats['entropy'],
             'action_std': current_action_std,
+            'replay_stats': replay_stats,
+            # Legacy keys
+            'avg_uncertainty': buffer_stats.get('avg_surprise', 1.0),
+            'avg_td_error': buffer_stats.get('avg_surprise', 1.0),
+            'near_consolidated': buffer_stats.get('near_consolidated', 0),
         }
         
         # Update running stats
@@ -716,53 +761,129 @@ class SleepWakeTrainer:
         self.stats['entropy'] = ppo_stats['entropy']
         
         print(f"  ✓ Sleep complete: pruned {pruned}, buffer {len(self.replay_buffer)}")
-        print(f"    Avg uncertainty: {stats['avg_uncertainty']:.4f}, Avg TD: {stats['avg_td_error']:.4f}")
-        print(f"    Policy loss: {ppo_stats['policy_loss']:.4f}, Value loss: {ppo_stats['value_loss']:.4f}")
-        print(f"    Entropy: {ppo_stats['entropy']:.4f}, Action std: {current_action_std:.4f}")
+        print(f"    Surprise: min={pruning_stats.surprise_min:.4f}, "
+              f"mean={pruning_stats.surprise_mean:.4f}, "
+              f"max={pruning_stats.surprise_max:.4f}, "
+              f"cutoff={pruning_stats.surprise_cutoff:.4f}")
+        print(f"    Policy loss: {ppo_stats['policy_loss']:.4f}, "
+              f"Value loss: {ppo_stats['value_loss']:.4f}")
+        print(f"    Entropy: {ppo_stats['entropy']:.4f}, "
+              f"Action std: {current_action_std:.4f}")
         
         return stats
     
-    def _consolidation_replay(self) -> None:
-        """Replay from buffer during consolidation (NREM-like)."""
-        batch = self.replay_buffer.sample(self.config.batch_size)
+    def _replay_score_and_consolidate(self) -> Dict:
+        """
+        NREM-like: Replay ALL memories through the current network.
         
-        states = torch.stack([t.state for t in batch]).to(self.device)
-        actions = torch.stack([t.action for t in batch]).to(self.device)
-        rewards = torch.tensor([t.reward for t in batch], dtype=torch.float32, device=self.device)
+        For each transition, compute "replay surprise" — how wrong the
+        network is about this memory.  This IS the biological signal:
+        during dreaming the cortex re-evaluates each memory, and the
+        ones it already knows (low surprise) are the ones whose
+        hippocampal traces fade.
         
-        # Normalize rewards
-        rewards = (rewards - self.reward_mean) / (self.reward_std + 1e-8)
+        Also performs consolidation training: weight updates prioritized
+        by surprise (learn more from surprising memories).
         
-        # Forward pass
-        mean_actions, _ = self.agent.brain(states)
-        values = self.value_head(states).squeeze(-1)
+        Returns:
+            Dict with replay statistics
+        """
+        if len(self.replay_buffer) < self.config.batch_size:
+            return {'mean_surprise': 0.0, 'consolidation_epochs': 0}
         
-        # Simple policy loss: encourage actions that led to high rewards
-        # Weight by advantage (reward as proxy since we don't have full trajectory)
-        advantages = rewards - values.detach()
+        all_surprises = []
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        n_batches = 0
         
-        dist = self._get_action_distribution(mean_actions)
-        log_probs = dist.log_prob(actions).sum(dim=-1)
+        for epoch in range(self.config.sleep_epochs):
+            for batch_transitions, batch_indices in self.replay_buffer.iter_batches(
+                self.config.batch_size
+            ):
+                # Unpack batch
+                states = torch.stack([t.state for t in batch_transitions]).to(self.device)
+                actions = torch.stack([t.action for t in batch_transitions]).to(self.device)
+                rewards = torch.tensor(
+                    [t.reward for t in batch_transitions],
+                    dtype=torch.float32, device=self.device,
+                )
+                next_states = torch.stack(
+                    [t.next_state for t in batch_transitions]
+                ).to(self.device)
+                
+                # Normalize rewards
+                rewards_norm = (rewards - self.reward_mean) / (self.reward_std + 1e-8)
+                
+                # --- Forward pass: what the network thinks NOW ---
+                mean_actions, _ = self.agent.brain(states)
+                values = self.value_head(states).squeeze(-1)
+                
+                # --- Compute replay surprise (per-transition) ---
+                with torch.no_grad():
+                    # A: Action divergence — how different is current policy?
+                    action_error = (mean_actions - actions).pow(2).sum(dim=-1)
+                    
+                    # B: Value surprise — how wrong is the value prediction?
+                    value_error = (rewards_norm - values).pow(2)
+                    
+                    # Combined replay surprise
+                    replay_surprise = action_error + value_error  # (batch,)
+                    
+                    # Store on transitions (last epoch's scores are final)
+                    for i, idx in enumerate(batch_indices):
+                        self.replay_buffer.buffer[idx].replay_surprise = float(
+                            replay_surprise[i].item()
+                        )
+                    
+                    if epoch == self.config.sleep_epochs - 1:
+                        all_surprises.extend(replay_surprise.cpu().tolist())
+                
+                # --- Consolidation training (weighted by surprise) ---
+                # The network learns MORE from surprising memories —
+                # biological replay strengthens weak traces
+                advantages = rewards_norm - values.detach()
+                
+                dist = self._get_action_distribution(mean_actions)
+                log_probs = dist.log_prob(actions).sum(dim=-1)
+                
+                policy_loss = -(log_probs * advantages).mean()
+                value_loss = F.mse_loss(values, rewards_norm)
+                
+                # EWC penalty
+                ewc_loss = self.ewc_loss.compute_loss(
+                    self.agent.brain, torch.tensor(0.0)
+                )
+                
+                total_loss = policy_loss + 0.5 * value_loss + ewc_loss
+                
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.agent.brain.parameters()) +
+                    list(self.value_head.parameters()),
+                    self.config.gradient_clip,
+                )
+                self.optimizer.step()
+                
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                n_batches += 1
         
-        policy_loss = -(log_probs * advantages).mean()
-        value_loss = F.mse_loss(values, rewards)
-        
-        # EWC penalty
-        ewc_loss = self.ewc_loss.compute_loss(self.agent.brain, torch.tensor(0.0))
-        
-        total_loss = policy_loss + 0.5 * value_loss + ewc_loss
-        
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.agent.brain.parameters()) + 
-            list(self.value_head.parameters()),
-            self.config.gradient_clip
-        )
-        self.optimizer.step()
-        
-        # Reset hidden state
+        # Reset hidden state after full replay
         self.agent.brain.reset_hidden(batch_size=1, device=self.device)
+        
+        return {
+            'mean_surprise': float(np.mean(all_surprises)) if all_surprises else 0.0,
+            'std_surprise': float(np.std(all_surprises)) if all_surprises else 0.0,
+            'consolidation_epochs': self.config.sleep_epochs,
+            'consolidation_batches': n_batches,
+            'avg_policy_loss': total_policy_loss / max(1, n_batches),
+            'avg_value_loss': total_value_loss / max(1, n_batches),
+        }
+    
+    def _consolidation_replay(self) -> None:
+        """Legacy method — now handled by _replay_score_and_consolidate."""
+        pass
     
     def _update_fisher_matrix(self) -> None:
         """Update Fisher Information Matrix from replay buffer."""
