@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """
-Phase 5: Full Training Script for Project Soliter.
+Phase 5b: Full Training Script with Biological Drive System.
 
-Runs the agent in the 2D world with full environment, resources,
-physics, and sensor systems. Logs everything needed for analysis:
-  - Agent position every N ticks
-  - Resource positions and availability
-  - Vitals over time
-  - Deaths (cause, position, tick)
-  - Reward components
-  - Sleep cycle statistics
-  - Surprise gating statistics
+Runs the agent with gradient sensors + drive-based internal reward.
+Logs drive states, satisfaction, consumption events alongside
+all previous metrics.
 
 Output: JSON log file + summary, plottable with plot_training.py
 """
@@ -27,7 +21,6 @@ from typing import List, Dict, Optional, Any
 
 import torch
 
-# Project imports — adjust based on your package structure
 from soliter.core.cfc_network import CfCBrain
 from soliter.agents.soliter_agent import SoliterAgent, VitalsConfig
 from soliter.environment import (
@@ -38,9 +31,9 @@ from soliter.environment import (
 from soliter.training import SleepWakeTrainer, TrainingConfig
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================================
 # DATA STRUCTURES FOR LOGGING
-# ═══════════════════════════════════════════════════════════════
+# ===================================================================
 
 @dataclass
 class TickSnapshot:
@@ -49,7 +42,7 @@ class TickSnapshot:
     cycle: int
     x: float
     y: float
-    heading: float  # Agent's facing direction
+    heading: float
     velocity: float
     energy: float
     hydration: float
@@ -60,7 +53,16 @@ class TickSnapshot:
     season: str
     is_night: bool
     touching_resource: bool
-    surprise: float  # Running surprise (if gating enabled)
+    surprise: float
+    # NEW: drive states
+    hunger: float
+    thirst: float
+    cold: float
+    curiosity: float
+    # NEW: reward breakdown
+    satisfaction: float
+    discomfort: float
+    consumed: str  # 'food', 'water', 'heat', or ''
 
 
 @dataclass
@@ -74,7 +76,7 @@ class DeathEvent:
     energy: float
     hydration: float
     temperature: float
-    life_duration: int  # Ticks since last death/start
+    life_duration: int
 
 
 @dataclass
@@ -92,13 +94,15 @@ class SleepEvent:
     value_loss: float
     entropy: float
     action_std: float
-    gated_out_this_cycle: int  # Transitions filtered by surprise gate
+    gated_out_this_cycle: int
+    # NEW: drive system stats
+    total_consumptions: int
 
 
-@dataclass 
+@dataclass
 class ResourceSnapshot:
     """Static resource positions (logged once at start)."""
-    resource_type: str  # 'feeder', 'fountain', 'heater'
+    resource_type: str
     index: int
     x: float
     y: float
@@ -108,37 +112,30 @@ class ResourceSnapshot:
 
 @dataclass
 class TrainingLog:
-    """Complete training log — saved as JSON."""
-    # Metadata
+    """Complete training log - saved as JSON."""
     start_time: str = ""
     config: Dict = field(default_factory=dict)
     world_config: Dict = field(default_factory=dict)
     device: str = ""
-    
-    # Static data
     resources: List[Dict] = field(default_factory=list)
-    
-    # Time series
     snapshots: List[Dict] = field(default_factory=list)
     deaths: List[Dict] = field(default_factory=list)
     sleeps: List[Dict] = field(default_factory=list)
-    
-    # Summary (filled at end)
     total_ticks: int = 0
     total_cycles: int = 0
     total_deaths: int = 0
     wall_time_seconds: float = 0.0
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================================
 # TRAINING LOOP
-# ═══════════════════════════════════════════════════════════════
+# ===================================================================
 
 def log_resources(resources: Dict) -> List[Dict]:
     """Snapshot all resource positions (called once)."""
     entries = []
     for rtype, rlist in resources.items():
-        singular = rtype.rstrip('s')  # feeders → feeder
+        singular = rtype.rstrip('s')
         for i, r in enumerate(rlist):
             entries.append(asdict(ResourceSnapshot(
                 resource_type=singular,
@@ -153,11 +150,11 @@ def log_resources(resources: Dict) -> List[Dict]:
 
 def run_training(args):
     """Main training loop."""
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
     print(f"Device: {device}")
-    
-    # ── Create components ──────────────────────────────────────
+
+    # Create components
     world_config = WorldConfig(
         width=args.world_size,
         height=args.world_size,
@@ -165,31 +162,35 @@ def run_training(args):
     world = World(world_config)
     resources = create_default_resources(args.world_size, args.world_size)
     physics = Physics()
-    sensors = SensorSystem(physics=physics)
-    
-    brain = CfCBrain()
+
+    # Enhanced sensors (51 channels: 41 original + 6 gradients + 4 drives)
+    sensor_config = SensorConfig(
+        gradient_scale_factor=args.world_size / 4.0,
+        enable_gradients=True,
+        enable_drive_input=True,
+    )
+    sensors = SensorSystem(config=sensor_config, physics=physics)
+
+    # Brain with 51 inputs (was 41)
+    brain = CfCBrain(sensory_size=51)
     agent = SoliterAgent(brain, VitalsConfig(), device)
-    
+
     config = TrainingConfig(
         wake_duration=args.wake_steps,
         learning_rate=args.lr,
         batch_size=args.batch_size,
         sleep_epochs=args.sleep_epochs,
-        # Surprise gating
         surprise_gating=args.surprise_gating,
         surprise_momentum=args.surprise_momentum,
         surprise_percentile=args.surprise_percentile,
-        # Pruning
         prune_fraction=args.prune_fraction,
-        # EWC
         lambda_ewc=args.lambda_ewc,
         fisher_decay=args.fisher_decay,
-        # Exploration
         action_std_init=args.action_std_init,
         action_std_min=args.action_std_min,
         action_std_decay=args.action_std_decay,
     )
-    
+
     trainer = SleepWakeTrainer(
         agent=agent,
         world=world,
@@ -198,8 +199,8 @@ def run_training(args):
         config=config,
         device=device,
     )
-    
-    # ── Initialize log ─────────────────────────────────────────
+
+    # Initialize log
     log = TrainingLog(
         start_time=time.strftime("%Y-%m-%d %H:%M:%S"),
         config={
@@ -217,6 +218,8 @@ def run_training(args):
             'action_std_init': args.action_std_init,
             'action_std_min': args.action_std_min,
             'action_std_decay': args.action_std_decay,
+            'world_size': args.world_size,
+            'sensor_channels': 51,
         },
         world_config={
             'width': args.world_size,
@@ -227,11 +230,13 @@ def run_training(args):
         device=str(device),
         resources=log_resources(resources),
     )
-    
-    # ── Print resource map ─────────────────────────────────────
+
+    # Print resource map
     print(f"\n{'='*70}")
-    print(f"WORLD: {args.world_size}×{args.world_size} | "
-          f"{args.cycles} cycles × {args.wake_steps} steps")
+    print(f"WORLD: {args.world_size}x{args.world_size} | "
+          f"{args.cycles} cycles x {args.wake_steps} steps")
+    print(f"SENSORS: 51 channels (4 vitals + 36 rays + 1 touch + 6 gradients + 4 drives)")
+    print(f"REWARD: Biological drive system (no shaped reward)")
     print(f"{'='*70}")
     print(f"\nResource positions:")
     for r in log.resources:
@@ -239,35 +244,41 @@ def run_training(args):
               f"({r['x']:.0f}, {r['y']:.0f}) r={r['radius']:.0f}")
     print(f"\nAgent start: ({agent.position[0]:.0f}, {agent.position[1]:.0f})")
     print(f"{'='*70}\n")
-    
-    # ── Training loop ──────────────────────────────────────────
+
+    # Training loop
     start_wall = time.time()
     global_tick = 0
     last_death_tick = 0
     gated_out_last_cycle = 0
     cycle_reward = 0.0
-    
+    last_reward_details = {}
+
     # Header
     print(f"{'Cyc':>4} {'D':>3} {'Cause':>10} {'Pos':>15} "
-          f"{'Enrg':>8} {'Hydr':>8} {'Temp':>8} "
-          f"{'Buf':>6} {'Prn':>5} {'Gate':>5} {'Reward':>8}")
-    print("-" * 100)
-    
+          f"{'Reward':>8} {'Satisf':>8} {'Discomf':>8} {'Consumed':>8} "
+          f"{'Buf':>6} {'ActStd':>8}")
+    print("-" * 110)
+
     for cycle in range(1, args.cycles + 1):
         cycle_reward = 0.0
         cycle_deaths = 0
         cycle_death_cause = ""
+        cycle_consumptions = 0
         gated_before = trainer.total_gated_out
-        
+
         for step in range(args.wake_steps):
             global_tick += 1
-            
-            # === WAKE STEP ===
-            reward, done = trainer.wake_step(resources)
+
+            # WAKE STEP (now returns reward_details)
+            reward, done, reward_details = trainer.wake_step(resources)
             world.step()
             cycle_reward += reward
-            
-            # === LOG SNAPSHOT (every N ticks) ===
+            last_reward_details = reward_details
+
+            if reward_details.get('consumption_bonus', 0) > 0:
+                cycle_consumptions += 1
+
+            # LOG SNAPSHOT
             if global_tick % args.log_interval == 0:
                 snap = TickSnapshot(
                     tick=global_tick,
@@ -284,16 +295,22 @@ def run_training(args):
                     ambient_temp=float(world.get_ambient_temperature()),
                     season=world.get_season().value,
                     is_night=world.is_night(),
-                    touching_resource=False,  # Could check sensors
+                    touching_resource=trainer._consumed_this_tick is not None,
                     surprise=float(trainer.running_surprise) if args.surprise_gating else 0.0,
+                    hunger=float(reward_details.get('hunger_drive', 0)),
+                    thirst=float(reward_details.get('thirst_drive', 0)),
+                    cold=float(reward_details.get('cold_drive', 0)),
+                    curiosity=float(reward_details.get('curiosity_drive', 0)),
+                    satisfaction=float(reward_details.get('satisfaction', 0)),
+                    discomfort=float(reward_details.get('discomfort', 0)),
+                    consumed=str(trainer._consumed_this_tick or ''),
                 )
                 log.snapshots.append(asdict(snap))
-            
-            # === DEATH ===
+
+            # DEATH
             if done:
                 cycle_deaths += 1
-                
-                # Determine cause
+
                 if agent.energy <= 0:
                     cause = "starvation"
                 elif agent.hydration <= 0:
@@ -302,10 +319,10 @@ def run_training(args):
                     cause = "hypothermia" if agent.temperature <= 0 else "hyperthermia"
                 else:
                     cause = "unknown"
-                
+
                 cycle_death_cause = cause
                 life_dur = global_tick - last_death_tick
-                
+
                 death = DeathEvent(
                     tick=global_tick,
                     cycle=cycle,
@@ -319,16 +336,17 @@ def run_training(args):
                 )
                 log.deaths.append(asdict(death))
                 last_death_tick = global_tick
-                
-                # Reset agent
+
+                # Reset agent AND drive system
                 agent.reset()
-        
-        # === SLEEP ===
+                trainer.drive_system.reset()
+
+        # SLEEP
         sleep_stats = trainer.sleep_cycle()
-        
+
         prn = sleep_stats['transitions_pruned']
         gated_this_cycle = trainer.total_gated_out - gated_before
-        
+
         sleep_event = SleepEvent(
             tick=global_tick,
             cycle=cycle,
@@ -343,45 +361,46 @@ def run_training(args):
             entropy=sleep_stats['entropy'],
             action_std=sleep_stats['action_std'],
             gated_out_this_cycle=gated_this_cycle,
+            total_consumptions=trainer.drive_system.total_consumption_events,
         )
         log.sleeps.append(asdict(sleep_event))
-        
-        # === PRINT CYCLE SUMMARY ===
+
+        # Print cycle summary
         death_str = f"{cycle_deaths}" if cycle_deaths > 0 else "."
         cause_str = cycle_death_cause[:10] if cycle_death_cause else ""
         pos_str = f"({agent.position[0]:.0f},{agent.position[1]:.0f})"
-        
+        consumed_str = f"{cycle_consumptions}" if cycle_consumptions > 0 else "."
+
         print(f"{cycle:4d} {death_str:>3} {cause_str:>10} {pos_str:>15} "
-              f"{agent.energy:5.1f}/{agent.energy:3.0f} "
-              f"{agent.hydration:5.1f}/{agent.hydration:3.0f} "
-              f"{agent.temperature:5.1f}/{agent.temperature:3.0f} "
+              f"{cycle_reward:8.1f} "
+              f"{last_reward_details.get('satisfaction', 0):8.3f} "
+              f"{last_reward_details.get('discomfort', 0):8.3f} "
+              f"{consumed_str:>8} "
               f"{sleep_stats['buffer_size']:6d} "
-              f"{prn.pruned:5d} "
-              f"{gated_this_cycle:5d} "
-              f"{cycle_reward:8.1f}")
-    
-    # ── Finalize ───────────────────────────────────────────────
+              f"{sleep_stats['action_std']:8.4f}")
+
+    # Finalize
     wall_time = time.time() - start_wall
     log.total_ticks = global_tick
     log.total_cycles = args.cycles
     log.total_deaths = len(log.deaths)
     log.wall_time_seconds = wall_time
-    
-    # ── Save log ───────────────────────────────────────────────
+
+    # Save log
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_path = out_dir / f"training_{timestamp}.json"
-    
+
     with open(log_path, 'w') as f:
         json.dump(asdict(log), f, indent=2, default=str)
-    
-    # ── Save checkpoint ────────────────────────────────────────
+
+    # Save checkpoint
     ckpt_path = out_dir / f"checkpoint_{timestamp}.pt"
     trainer.save_checkpoint(str(ckpt_path))
-    
-    # ── Print summary ──────────────────────────────────────────
+
+    # Print summary
     print(f"\n{'='*70}")
     print(f"TRAINING COMPLETE")
     print(f"{'='*70}")
@@ -394,8 +413,8 @@ def run_training(args):
             causes[d['cause']] = causes.get(d['cause'], 0) + 1
         for c, n in sorted(causes.items(), key=lambda x: -x[1]):
             print(f"    {c}: {n} ({100*n/len(log.deaths):.0f}%)")
+    print(f"  Resource consumptions: {trainer.drive_system.total_consumption_events}")
     print(f"  Wall time: {wall_time:.1f}s ({global_tick/wall_time:.0f} ticks/s)")
-    print(f"  Snapshots: {len(log.snapshots)}")
     print(f"  Log: {log_path}")
     print(f"  Checkpoint: {ckpt_path}")
     print(f"\nPlot with:")
@@ -403,51 +422,28 @@ def run_training(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Soliter agent")
-    
-    # Duration
-    parser.add_argument('--cycles', type=int, default=200,
-                        help='Number of wake-sleep cycles')
-    parser.add_argument('--wake-steps', type=int, default=2000,
-                        help='Ticks per wake cycle (default: 2000)')
-    
-    # World
-    parser.add_argument('--world-size', type=int, default=1000,
-                        help='World width/height')
-    
-    # Learning
+    parser = argparse.ArgumentParser(description="Train Soliter agent (v2 with drives)")
+
+    parser.add_argument('--cycles', type=int, default=200)
+    parser.add_argument('--wake-steps', type=int, default=2000)
+    parser.add_argument('--world-size', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=0.0003)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--sleep-epochs', type=int, default=5)
-    
-    # Surprise gating
     parser.add_argument('--surprise-gating', action='store_true', default=True)
     parser.add_argument('--no-surprise-gating', dest='surprise_gating', action='store_false')
     parser.add_argument('--surprise-momentum', type=float, default=0.95)
     parser.add_argument('--surprise-percentile', type=float, default=0.3)
-    
-    # Pruning
     parser.add_argument('--prune-fraction', type=float, default=0.2)
-    
-    # EWC
     parser.add_argument('--lambda-ewc', type=float, default=155000.0)
     parser.add_argument('--fisher-decay', type=float, default=0.77)
-    
-    # Exploration
     parser.add_argument('--action-std-init', type=float, default=0.5)
     parser.add_argument('--action-std-min', type=float, default=0.1)
     parser.add_argument('--action-std-decay', type=float, default=0.995)
-    
-    # Logging
-    parser.add_argument('--log-interval', type=int, default=10,
-                        help='Log position/vitals every N ticks')
-    parser.add_argument('--output-dir', type=str, default='experiments',
-                        help='Output directory for logs and checkpoints')
-    
-    # Hardware
-    parser.add_argument('--cpu', action='store_true',
-                        help='Force CPU even if CUDA available')
-    
+    parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--output-dir', type=str, default='experiments')
+    parser.add_argument('--cpu', action='store_true')
+
     args = parser.parse_args()
     run_training(args)
 
