@@ -22,7 +22,8 @@ from typing import List, Dict, Optional, Any
 import torch
 
 from soliter.core.cfc_network import CfCBrain
-from soliter.agents.soliter_agent import SoliterAgent, VitalsConfig
+from soliter.agents.soliter_agent import SoliterAgent
+from soliter.utils.config import config
 from soliter.environment import (
     World, WorldConfig,
     create_default_resources,
@@ -154,18 +155,24 @@ def run_training(args):
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
     print(f"Device: {device}")
 
-    # Create components
+    # Create components with config values, using command-line args only if explicitly set
+    # (default command-line value of 1000 should be ignored in favor of config)
+    world_width = config.world.size[0] if args.world_size == 1000 else args.world_size
+    world_height = config.world.size[1] if args.world_size == 1000 else args.world_size
+    
     world_config = WorldConfig(
-        width=args.world_size,
-        height=args.world_size,
+        width=world_width,
+        height=world_height,
+        seasonal_period=config.world.seasonal_period,
+        diurnal_period=config.world.diurnal_period
     )
     world = World(world_config)
-    resources = create_default_resources(args.world_size, args.world_size)
+    resources = create_default_resources(world_width, world_height)
     physics = Physics()
 
     # Enhanced sensors (51 channels: 41 original + 6 gradients + 4 drives)
     sensor_config = SensorConfig(
-        gradient_scale_factor=args.world_size / 4.0,
+        gradient_scale_factor=world_width / 4.0,
         enable_gradients=True,
         enable_drive_input=True,
     )
@@ -173,22 +180,42 @@ def run_training(args):
 
     # Brain with 51 inputs (was 41)
     brain = CfCBrain(sensory_size=51)
-    agent = SoliterAgent(brain, VitalsConfig(), device)
+    from soliter.agents.soliter_agent import VitalsConfig
+    
+    vitals_config = VitalsConfig(
+        initial_energy=config.agent.initial_energy,
+        initial_hydration=config.agent.initial_hydration,
+        initial_temperature=config.agent.initial_temperature,
+        initial_wakefulness=config.agent.initial_wakefulness,
+        energy_decay_base=config.agent.energy_decay_base,
+        hydration_decay_base=config.agent.hydration_decay_base,
+        temperature_decay_rate=config.agent.temperature_decay_rate,
+        wakefulness_decay_rate=config.agent.wakefulness_decay_rate,
+        base_speed=config.agent.base_speed,
+        base_turn_rate=config.agent.base_turn_rate,
+        sleep_threshold=config.agent.sleep_threshold,
+    )
+    agent = SoliterAgent(brain, vitals_config, device)
 
-    config = TrainingConfig(
-        wake_duration=args.wake_steps,
-        learning_rate=args.lr,
-        batch_size=args.batch_size,
-        sleep_epochs=args.sleep_epochs,
-        surprise_gating=args.surprise_gating,
-        surprise_momentum=args.surprise_momentum,
-        surprise_percentile=args.surprise_percentile,
-        prune_fraction=args.prune_fraction,
-        lambda_ewc=args.lambda_ewc,
-        fisher_decay=args.fisher_decay,
-        action_std_init=args.action_std_init,
-        action_std_min=args.action_std_min,
-        action_std_decay=args.action_std_decay,
+    # Spawn agent near center (not corner)
+    center = np.array([world_width / 2.0, world_height / 2.0])
+    agent.position = center.copy()
+
+    training_config = TrainingConfig(
+        wake_duration=config.training.wake_duration or 10000,
+        learning_rate=config.training.learning_rate,
+        batch_size=config.memory.batch_size,
+        sleep_epochs=config.training.sleep_epochs,
+        surprise_gating=getattr(config.training, 'surprise_gating', True),
+        surprise_momentum=getattr(config.training, 'surprise_momentum', 0.95),
+        surprise_percentile=getattr(config.training, 'surprise_percentile', 0.3),
+        prune_fraction=getattr(config.memory, 'prune_fraction', 0.2),
+        lambda_ewc=config.memory.ewc_lambda,
+        fisher_decay=config.memory.fisher_decay,
+        action_std_init=getattr(config.training, 'action_std_init', 0.5),
+        action_std_min=getattr(config.training, 'action_std_min', 0.1),
+        action_std_decay=getattr(config.training, 'action_std_decay', 0.995),
+        buffer_capacity=getattr(config.memory, 'buffer_max_size', 1000000),
     )
 
     trainer = SleepWakeTrainer(
@@ -196,7 +223,7 @@ def run_training(args):
         world=world,
         sensors=sensors,
         physics=physics,
-        config=config,
+        config=training_config,
         device=device,
     )
 
@@ -218,12 +245,12 @@ def run_training(args):
             'action_std_init': args.action_std_init,
             'action_std_min': args.action_std_min,
             'action_std_decay': args.action_std_decay,
-            'world_size': args.world_size,
+            'world_size': world_width,
             'sensor_channels': 51,
         },
         world_config={
-            'width': args.world_size,
-            'height': args.world_size,
+            'width': world_width,
+            'height': world_height,
             'seasonal_period': world_config.seasonal_period,
             'diurnal_period': world_config.diurnal_period,
         },
@@ -233,7 +260,7 @@ def run_training(args):
 
     # Print resource map
     print(f"\n{'='*70}")
-    print(f"WORLD: {args.world_size}x{args.world_size} | "
+    print(f"WORLD: {world_width}x{world_height} | "
           f"{args.cycles} cycles x {args.wake_steps} steps")
     print(f"SENSORS: 51 channels (4 vitals + 36 rays + 1 touch + 6 gradients + 4 drives)")
     print(f"REWARD: Biological drive system (no shaped reward)")
@@ -337,8 +364,10 @@ def run_training(args):
                 log.deaths.append(asdict(death))
                 last_death_tick = global_tick
 
-                # Reset agent AND drive system
+                # Reset agent AND drive system — respawn near center
                 agent.reset()
+                agent.position = center + np.random.uniform(-20, 20, size=2)
+                agent.position = agent.position % config.world.size[0]  # wrap
                 trainer.drive_system.reset()
 
         # SLEEP
@@ -424,14 +453,15 @@ def run_training(args):
 def main():
     parser = argparse.ArgumentParser(description="Train Soliter agent (v2 with drives)")
 
+    # Only keep arguments that aren't in the config file
     parser.add_argument('--cycles', type=int, default=200)
+    parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--output-dir', type=str, default='experiments')
     parser.add_argument('--wake-steps', type=int, default=2000)
-    parser.add_argument('--world-size', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=0.0003)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--sleep-epochs', type=int, default=5)
     parser.add_argument('--surprise-gating', action='store_true', default=True)
-    parser.add_argument('--no-surprise-gating', dest='surprise_gating', action='store_false')
     parser.add_argument('--surprise-momentum', type=float, default=0.95)
     parser.add_argument('--surprise-percentile', type=float, default=0.3)
     parser.add_argument('--prune-fraction', type=float, default=0.2)
@@ -440,10 +470,9 @@ def main():
     parser.add_argument('--action-std-init', type=float, default=0.5)
     parser.add_argument('--action-std-min', type=float, default=0.1)
     parser.add_argument('--action-std-decay', type=float, default=0.995)
-    parser.add_argument('--log-interval', type=int, default=10)
-    parser.add_argument('--output-dir', type=str, default='experiments')
-    parser.add_argument('--cpu', action='store_true')
-
+    parser.add_argument('--world-size', type=int, default=1000)
+    parser.add_argument('--log-interval', type=int, default=1000)
+    
     args = parser.parse_args()
     run_training(args)
 

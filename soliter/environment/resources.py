@@ -130,25 +130,19 @@ class Heater(Resource):
 
 
 def create_default_resources(world_width: int = 1000, world_height: int = 1000) -> dict:
-    """
-    Create a default set of resources scattered in the world.
-    
-    Returns:
-        Dictionary with 'feeders', 'fountains', 'heaters' lists
-    """
+    '''Create a default set of resources scattered in the world.'''
     np.random.seed(42)  # Reproducible placement
     
-    # Create 5 of each resource type
     num_each = 5
     
     feeders = []
     fountains = []
     heaters = []
     
+    # Scale margin to world size (10% of smallest dimension, min 5)
+    margin = max(5.0, min(world_width, world_height) * 0.1)
+    
     for i in range(num_each):
-        # Random positions, avoiding edges
-        margin = 100
-        
         # Feeder
         feeder_pos = np.array([
             np.random.uniform(margin, world_width - margin),

@@ -4,12 +4,12 @@
 experiment:
   name: "soliter_baseline"
   seed: 42
-  device: "cuda"  # or "cpu"
+  device: "cuda"  # Use CUDA GPU if available, falls back to CPU
   save_dir: "data/experiments"
   checkpoint_interval: 10  # Save every N days
 
 world:
-  size: [1000, 1000]
+  size: [300, 300]
   seasonal_period: 20000  # ticks per year
   diurnal_period: 2000    # ticks per day
   dt: 0.1                 # physics timestep
@@ -30,7 +30,7 @@ agent:
   # Vital decay rates
   energy_decay_base: 0.01
   hydration_decay_base: 0.008
-  temperature_decay_rate: 0.05
+  temperature_decay_rate: 0.015
   wakefulness_decay_rate: 0.0001
   
   # Movement parameters
@@ -83,6 +83,7 @@ training:
   sleep_epochs: 5
   scaling_rate: 0.01
   target_activity: 0.5
+  wake_duration: 10000      # Duration of wake period before sleep
 
 visualization:
   render: true
