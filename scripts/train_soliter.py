@@ -197,9 +197,28 @@ def run_training(args):
     )
     agent = SoliterAgent(brain, vitals_config, device)
 
-    # Spawn agent near center (not corner)
-    center = np.array([world_width / 2.0, world_height / 2.0])
-    agent.position = center.copy()
+    # Initial spawn: Use resource cluster center
+    # Find resource cluster center
+    all_resource_positions = []
+    for rtype in ['feeders', 'fountains', 'heaters']:
+        for r in resources[rtype]:
+            all_resource_positions.append(r.position)
+    
+    if all_resource_positions:
+        resource_center = np.mean(all_resource_positions, axis=0)
+        # Initial spawn near resources for first life
+        agent.position = resource_center + np.random.uniform(-10, 10, size=2)
+        agent.position = np.clip(agent.position, 0, [world_width - 1, world_height - 1])
+        print(f"Agent initial spawn at: ({agent.position[0]:.1f}, {agent.position[1]:.1f})")
+        print(f"Resource cluster center: ({resource_center[0]:.1f}, {resource_center[1]:.1f})")
+    else:
+        # Fallback to center
+        center = np.array([world_width / 2.0, world_height / 2.0])
+        agent.position = center.copy()
+        resource_center = center  # For respawn logic
+    
+    # Track last death location for natural respawn
+    last_death_location = agent.position.copy()
 
     training_config = TrainingConfig(
         wake_duration=config.training.wake_duration or 10000,
@@ -363,11 +382,17 @@ def run_training(args):
                 )
                 log.deaths.append(asdict(death))
                 last_death_tick = global_tick
+                
+                # Store death location for respawn
+                last_death_location = agent.position.copy()
 
-                # Reset agent AND drive system — respawn near center
+                # BIOLOGICAL RESPAWN: Agent respawns near where it died
+                # This is more natural - the body doesn't teleport to resource center
+                # The agent must learn to navigate from wherever it fails
                 agent.reset()
-                agent.position = center + np.random.uniform(-20, 20, size=2)
-                agent.position = agent.position % config.world.size[0]  # wrap
+                # Respawn near death location with variation (simulates new life nearby)
+                agent.position = last_death_location + np.random.uniform(-20, 20, size=2)
+                agent.position = np.clip(agent.position, 0, [world_width - 1, world_height - 1])
                 trainer.drive_system.reset()
 
         # SLEEP

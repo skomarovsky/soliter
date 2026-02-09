@@ -9,16 +9,16 @@ experiment:
   checkpoint_interval: 10  # Save every N days
 
 world:
-  size: [300, 300]
+  size: [150, 150]  # PHASE 5 FIX: Reduced from 300x300 to match agent exploration range
   seasonal_period: 20000  # ticks per year
   diurnal_period: 2000    # ticks per day
   dt: 0.1                 # physics timestep
   
-  # Resource configuration
+  # Resource configuration (scaled for 150x150 world)
   resources:
-    feeders: 4
-    fountains: 4
-    heaters: 3
+    feeders: 3     # Reduced from 4 to maintain density
+    fountains: 3   # Reduced from 4 to maintain density
+    heaters: 2     # Reduced from 3 to maintain density
 
 agent:
   # Initial vitals
@@ -83,7 +83,7 @@ training:
   sleep_epochs: 5
   scaling_rate: 0.01
   target_activity: 0.5
-  wake_duration: 10000      # Duration of wake period before sleep
+  wake_duration: 2000      # Duration of wake period before sleep
 
 visualization:
   render: true

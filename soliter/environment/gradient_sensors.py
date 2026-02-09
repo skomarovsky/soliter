@@ -78,9 +78,13 @@ class GradientSensors:
         world_height: float = 1000.0,
         sensor_noise: float = 0.0,
         season_availability: Dict[str, bool] = None,
+        drive_states: Dict[str, float] = None,
     ) -> np.ndarray:
         """
         Compute gradient vectors toward nearest resources.
+        
+        NEW: Gradients are amplified by corresponding drive states.
+        When hungry, food gradients become more salient (attention mechanism).
 
         Args:
             agent_position: [x, y] agent position
@@ -90,11 +94,13 @@ class GradientSensors:
             sensor_noise: Impairment level [0, 1]
             season_availability: Optional dict {'feeders': True/False, ...}
                 If provided, unavailable resources produce zero gradient.
+            drive_states: Optional dict {'hunger': float, 'thirst': float, 'cold': float}
+                If provided, amplifies corresponding gradients (biological attention)
 
         Returns:
             np.ndarray of shape (6,): [food_gx, food_gy, water_gx, water_gy, heat_gx, heat_gy]
             Each pair is a direction vector scaled by proximity.
-            Values in approximately [-1, 1].
+            Values in approximately [-1, 1] (before drive amplification).
         """
         gradients = np.zeros(6, dtype=np.float32)
 
@@ -121,6 +127,24 @@ class GradientSensors:
             world_width, world_height,
         )
         gradients[4:6] = heat_grad
+
+        # DRIVE-MODULATED ATTENTION: Amplify gradients based on need
+        # When hungry, food gradients become more salient (selective attention)
+        # Biological basis: Hungry animals have enhanced olfaction for food
+        if drive_states is not None:
+            hunger = drive_states.get('hunger', 0.0)
+            thirst = drive_states.get('thirst', 0.0)
+            cold = drive_states.get('cold', 0.0)
+            
+            # Amplification: 1.0 (no drive) → 3.0 (max drive)
+            # This makes weak gradients stronger when needed
+            food_amp = 1.0 + 2.0 * hunger
+            water_amp = 1.0 + 2.0 * thirst
+            heat_amp = 1.0 + 2.0 * cold
+            
+            gradients[0:2] *= food_amp
+            gradients[2:4] *= water_amp
+            gradients[4:6] *= heat_amp
 
         # Apply noise (impaired senses)
         if sensor_noise > 0:

@@ -120,13 +120,24 @@ class SensorSystem:
         touch = self._get_touch_reading(agent_position, resources)
 
         # 4. Gradient sensors (6 values) — smell/humidity/heat sensing
+        # NEW: Pass drive states to modulate gradient sensitivity (attention)
         if self.config.enable_gradients:
+            # Extract drive states from drive_vector if available
+            drive_states_dict = None
+            if drive_vector is not None and len(drive_vector) >= 3:
+                drive_states_dict = {
+                    'hunger': float(drive_vector[0]),
+                    'thirst': float(drive_vector[1]),
+                    'cold': float(drive_vector[2]),
+                }
+            
             gradient_readings = self.gradient_sensors.compute_gradients(
                 agent_position=agent_position,
                 resources=resources,
                 world_width=world_width,
                 world_height=world_height,
                 sensor_noise=sensor_noise,
+                drive_states=drive_states_dict,
             )
         else:
             gradient_readings = np.zeros(6, dtype=np.float32)

@@ -70,6 +70,11 @@ class SoliterAgent:
         self.rotation = 0.0  # radians
         self.radius = 10.0  # collision radius
         
+        # Movement tracking (for logging)
+        self.heading = 0.0  # Current heading in radians
+        self.last_velocity = 0.0  # Last velocity magnitude
+        self.last_delta = np.array([0.0, 0.0])  # Last movement vector
+        
         # Vitals
         self.energy = config.initial_energy
         self.hydration = config.initial_hydration
@@ -248,16 +253,24 @@ class SoliterAgent:
             dt: Time step
         """
         if self.is_sleeping or not self.is_alive:
+            self.last_velocity = 0.0
+            self.last_delta = np.array([0.0, 0.0])
+            self.heading = self.rotation
             return
         
         # Update rotation
         self.rotation += turn * dt
         self.rotation = self.rotation % (2 * np.pi)
         
+        # Track heading and velocity for logging
+        self.heading = self.rotation
+        self.last_velocity = velocity
+        
         # Update position
         dx = velocity * np.cos(self.rotation) * dt
         dy = velocity * np.sin(self.rotation) * dt
-        self.position += np.array([dx, dy])
+        self.last_delta = np.array([dx, dy])
+        self.position += self.last_delta
     
     def _check_death(self) -> None:
         """Check if any vital has reached 0 (death condition)."""
