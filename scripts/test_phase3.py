@@ -57,7 +57,7 @@ physics = Physics(1000, 1000)
 # Raycasting
 origin = np.array([500.0, 500.0])
 obstacles = [
-    (resources['feeders'][0].position, resources['feeders'][0].radius, 'feeder')
+    (resources['feeders'][0].position, resources['feeders'][0].detection_radius, 'feeder')
 ]
 
 results = physics.raycast_360(origin, 36, 200.0, obstacles)

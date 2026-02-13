@@ -83,7 +83,7 @@ training:
   sleep_epochs: 5
   scaling_rate: 0.01
   target_activity: 0.5
-  wake_duration: 2000      # Duration of wake period before sleep
+  wake_duration: 10000      # Duration of wake period before sleep
 
 visualization:
   render: true

@@ -104,26 +104,32 @@ class GradientSensors:
         """
         gradients = np.zeros(6, dtype=np.float32)
 
+        # CRITICAL: Only sense resources that have capacity (not depleted)
+        # Filter out depleted resources - no point sensing what you can't consume!
+        
         # Food gradient (channels 0-1)
+        available_feeders = [f for f in resources.get('feeders', []) if f.can_consume()]
         food_grad = self._nearest_gradient(
             agent_position,
-            resources.get('feeders', []),
+            available_feeders,  # Only non-depleted feeders
             world_width, world_height,
         )
         gradients[0:2] = food_grad
 
         # Water gradient (channels 2-3)
+        available_fountains = [f for f in resources.get('fountains', []) if f.can_consume()]
         water_grad = self._nearest_gradient(
             agent_position,
-            resources.get('fountains', []),
+            available_fountains,  # Only non-depleted fountains
             world_width, world_height,
         )
         gradients[2:4] = water_grad
 
         # Heat gradient (channels 4-5)
+        available_heaters = [h for h in resources.get('heaters', []) if h.can_consume()]
         heat_grad = self._nearest_gradient(
             agent_position,
-            resources.get('heaters', []),
+            available_heaters,  # Only non-depleted heaters
             world_width, world_height,
         )
         gradients[4:6] = heat_grad

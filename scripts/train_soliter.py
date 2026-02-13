@@ -107,7 +107,8 @@ class ResourceSnapshot:
     index: int
     x: float
     y: float
-    radius: float
+    detection_radius: float
+    consumption_radius: float
     restore_rate: float
 
 
@@ -143,7 +144,8 @@ def log_resources(resources: Dict) -> List[Dict]:
                 index=i,
                 x=float(r.position[0]),
                 y=float(r.position[1]),
-                radius=float(r.radius),
+                detection_radius=float(r.detection_radius),
+                consumption_radius=float(r.consumption_radius),
                 restore_rate=float(r.restore_rate),
             )))
     return entries

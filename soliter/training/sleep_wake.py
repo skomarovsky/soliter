@@ -324,8 +324,9 @@ class SleepWakeTrainer:
         should_sleep = action[2].item() > 0.5
 
         # Execute
-        self.agent.move(velocity, turn, dt=1.0)
-        self.agent.position = self.physics.wrap_position(self.agent.position)
+        world_bounds = (self.world.config.width, self.world.config.height)
+        self.agent.move(velocity, turn, world_bounds=world_bounds, dt=1.0)
+        # Position is now clipped in move() - no wrapping
         ambient_temp = self.world.get_ambient_temperature()
         self.agent.update_vitals(velocity, ambient_temp, dt=1.0)
 
@@ -395,24 +396,40 @@ class SleepWakeTrainer:
         """Check resources and track what was consumed for drive system."""
         seasonal_period = self.world.config.seasonal_period
         is_night = self.world.is_night()
+        
+        # Update all resources (recovery over time)
+        for resource_list in resources.values():
+            for resource in resource_list:
+                resource.update(self.world.tick)
 
+        # Check consumption for each resource type
+        # IMPORTANT: Now uses STRICT consumption_radius, not detection_radius
         for feeder in resources.get('feeders', []):
             if feeder.is_available(self.world.tick, seasonal_period):
-                if feeder.is_agent_in_range(self.agent.position, is_night):
-                    self.agent.consume_resource('food', feeder.get_restore_amount())
-                    self._consumed_this_tick = 'food'
+                if feeder.is_agent_in_consumption_range(self.agent.position, is_night):
+                    if feeder.can_consume():  # Check if resource has capacity
+                        actual_amount = feeder.consume(self.world.tick, seasonal_period)
+                        if actual_amount > 0:
+                            self.agent.consume_resource('food', actual_amount)
+                            self._consumed_this_tick = 'food'
 
         for fountain in resources.get('fountains', []):
             if fountain.is_available(self.world.tick, seasonal_period):
-                if fountain.is_agent_in_range(self.agent.position, is_night):
-                    self.agent.consume_resource('water', fountain.get_restore_amount())
-                    self._consumed_this_tick = 'water'
+                if fountain.is_agent_in_consumption_range(self.agent.position, is_night):
+                    if fountain.can_consume():
+                        actual_amount = fountain.consume(self.world.tick, seasonal_period)
+                        if actual_amount > 0:
+                            self.agent.consume_resource('water', actual_amount)
+                            self._consumed_this_tick = 'water'
 
         for heater in resources.get('heaters', []):
             if heater.is_available(self.world.tick, seasonal_period):
-                if heater.is_agent_in_range(self.agent.position, is_night):
-                    self.agent.consume_resource('heat', heater.get_restore_amount())
-                    self._consumed_this_tick = 'heat'
+                if heater.is_agent_in_consumption_range(self.agent.position, is_night):
+                    if heater.can_consume():
+                        actual_amount = heater.consume(self.world.tick, seasonal_period)
+                        if actual_amount > 0:
+                            self.agent.consume_resource('heat', actual_amount)
+                            self._consumed_this_tick = 'heat'
 
     def _ppo_update(self) -> Dict[str, float]:
         """Perform PPO policy update."""

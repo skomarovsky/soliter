@@ -189,16 +189,17 @@ class SensorSystem:
         Value of 0.0 means obstacle very close.
         """
         # Build obstacle list
+        # Use detection_radius for raycasts (visual/sensing range)
         obstacles = []
 
         for feeder in resources.get('feeders', []):
-            obstacles.append((feeder.position, feeder.radius, 'feeder'))
+            obstacles.append((feeder.position, feeder.detection_radius, 'feeder'))
 
         for fountain in resources.get('fountains', []):
-            obstacles.append((fountain.position, fountain.radius, 'fountain'))
+            obstacles.append((fountain.position, fountain.detection_radius, 'fountain'))
 
         for heater in resources.get('heaters', []):
-            obstacles.append((heater.position, heater.radius, 'heater'))
+            obstacles.append((heater.position, heater.detection_radius, 'heater'))
 
         # Cast rays
         raycast_results = self.physics.raycast_360(
@@ -233,13 +234,14 @@ class SensorSystem:
     ) -> float:
         """
         Check if agent is touching any resource.
-
+        
+        Uses consumption_radius (close contact range).
         Returns 1.0 if touching something, 0.0 otherwise.
         """
         for resource_list in resources.values():
             for resource in resource_list:
                 distance = np.linalg.norm(agent_position - resource.position)
-                if distance < resource.radius + self.config.touch_threshold:
+                if distance < resource.consumption_radius + self.config.touch_threshold:
                     return 1.0
         return 0.0
 

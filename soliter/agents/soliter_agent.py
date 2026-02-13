@@ -243,13 +243,14 @@ class SoliterAgent:
         self.is_sleeping = False
         self.wakefulness = 1.0
     
-    def move(self, velocity: float, turn: float, dt: float = 1.0) -> None:
+    def move(self, velocity: float, turn: float, world_bounds: Tuple[float, float] = None, dt: float = 1.0) -> None:
         """
         Update position based on velocity and turn rate.
         
         Args:
             velocity: Forward velocity
             turn: Turn rate (radians per tick)
+            world_bounds: (width, height) of world for boundary enforcement
             dt: Time step
         """
         if self.is_sleeping or not self.is_alive:
@@ -271,6 +272,12 @@ class SoliterAgent:
         dy = velocity * np.sin(self.rotation) * dt
         self.last_delta = np.array([dx, dy])
         self.position += self.last_delta
+        
+        # CRITICAL: Enforce world boundaries (prevent escape)
+        if world_bounds is not None:
+            world_width, world_height = world_bounds
+            self.position[0] = np.clip(self.position[0], 0, world_width - 1)
+            self.position[1] = np.clip(self.position[1], 0, world_height - 1)
     
     def _check_death(self) -> None:
         """Check if any vital has reached 0 (death condition)."""
