@@ -137,37 +137,62 @@ class DriveSystem:
         normalized = min(1.0, deviation / self.config.temperature_range)
         return normalized ** self.config.drive_exponent
 
-    def _compute_curiosity(self, sensor_readings: np.ndarray = None) -> float:
+    def _compute_curiosity(self, hunger: float, thirst: float, cold: float) -> float:
         """
-        Curiosity drive: builds when sensory input is monotonous.
-
-        Uses variance of recent sensor readings as novelty proxy.
-        Low variance = boring = high curiosity drive.
+        Curiosity drive: Builds over time, suppressed by surprise and survival needs.
+        
+        BIOLOGICAL PRINCIPLE: Energy Conservation
+        - Curiosity builds when bored (nothing happening)
+        - Surprise temporarily satisfies curiosity (resets it)
+        - Survival needs suppress curiosity
+        - No drives → no movement (conserve energy!)
+        
+        Args:
+            hunger: Hunger drive [0, 1]
+            thirst: Thirst drive [0, 1]
+            cold: Cold drive [0, 1]
+            
+        Returns:
+            Curiosity drive [0, 1]
         """
-        if sensor_readings is not None:
-            # Compute instantaneous sensory novelty
-            # (variance of current reading vs recent history)
-            current_hash = float(np.std(sensor_readings))
-            self._sensory_history.append(current_hash)
-
-            # Keep window bounded
-            if len(self._sensory_history) > self.config.curiosity_window:
-                self._sensory_history = self._sensory_history[-self.config.curiosity_window:]
-
-            if len(self._sensory_history) >= 2:
-                # Variance of the sensory hash sequence
-                recent_variance = np.std(self._sensory_history)
-                # Update EMA
-                alpha = 1.0 - self.config.curiosity_decay
-                self._sensory_ema = self.config.curiosity_decay * self._sensory_ema + alpha * recent_variance
-            else:
-                self._sensory_ema = 0.1  # Default moderate novelty
-
-        # Curiosity = inverse of novelty (bored when nothing changes)
-        # Clamped to [0, 1]
-        novelty = min(1.0, self._sensory_ema * 10.0)  # Scale so typical variance → ~0.5
-        self._curiosity_drive = max(0.0, min(1.0, 1.0 - novelty))
+        # Maximum survival drive (most urgent need)
+        max_survival_drive = max(hunger, thirst, cold)
+        
+        # If survival critical (>75%), curiosity HEAVILY suppressed
+        if max_survival_drive > 0.75:
+            survival_suppression = 0.0  # Complete suppression
+        elif max_survival_drive > 0.5:
+            # Gradual suppression 50-75%
+            survival_suppression = (0.75 - max_survival_drive) / 0.25
+        else:
+            # Minimal suppression when needs met
+            survival_suppression = 1.0
+        
+        # Curiosity builds over time (boredom)
+        # Decays after surprise events
+        # This is the "itch to explore" that grows when nothing interesting happens
+        self._curiosity_drive = min(1.0, max(0.0, self._curiosity_drive * survival_suppression))
+        
         return self._curiosity_drive
+    
+    def increase_curiosity(self, amount: float = 0.01):
+        """
+        Gradually increase curiosity over time (boredom builds).
+        Call this each tick when nothing interesting happens.
+        """
+        self._curiosity_drive = min(1.0, self._curiosity_drive + amount)
+    
+    def reduce_curiosity_from_surprise(self, surprise: float):
+        """
+        Surprise satisfies curiosity temporarily.
+        High surprise → curiosity drops significantly.
+        
+        Args:
+            surprise: Surprise magnitude [0, 1]
+        """
+        # Surprise reduces curiosity proportionally
+        reduction = surprise * 0.5  # Surprise satisfies up to 50% of curiosity
+        self._curiosity_drive = max(0.0, self._curiosity_drive - reduction)
 
     # ── Public Interface ───────────────────────────────────────
 
@@ -178,11 +203,19 @@ class DriveSystem:
 
         Returns dict with hunger, thirst, cold, curiosity in [0, 1].
         """
+        # Compute survival drives first
+        hunger = self._compute_hunger(energy)
+        thirst = self._compute_thirst(hydration)
+        cold = self._compute_cold(temperature)
+        
+        # Curiosity is inversely proportional to survival drives
+        curiosity = self._compute_curiosity(hunger, thirst, cold)
+        
         return {
-            'hunger': self._compute_hunger(energy),
-            'thirst': self._compute_thirst(hydration),
-            'cold': self._compute_cold(temperature),
-            'curiosity': self._compute_curiosity(sensor_readings),
+            'hunger': hunger,
+            'thirst': thirst,
+            'cold': cold,
+            'curiosity': curiosity,
         }
 
     def get_drive_vector(self, energy: float, hydration: float,
@@ -247,7 +280,11 @@ class DriveSystem:
         hunger_now = self._compute_hunger(energy)
         thirst_now = self._compute_thirst(hydration)
         cold_now = self._compute_cold(temperature)
-        curiosity_now = self._compute_curiosity(sensor_readings)
+        
+        # Curiosity builds over time if nothing interesting happens
+        # Surprise (big reward changes) temporarily satisfies it
+        self.increase_curiosity(amount=0.005)  # Slow buildup (boredom)
+        curiosity_now = self._compute_curiosity(hunger_now, thirst_now, cold_now)
 
         # ── Satisfaction: drive REDUCTION feels good ───────────
         hunger_satisfaction = max(0.0, self._prev_hunger - hunger_now)
@@ -273,25 +310,39 @@ class DriveSystem:
         if consumed_resource is not None:
             consumption_reward = self.config.consumption_bonus
             self.total_consumption_events += 1
+            # Consumption is surprising! Reduces curiosity temporarily
+            self.reduce_curiosity_from_surprise(surprise=0.3)
 
-        # ── Curiosity reward: novelty reduces boredom drive ────
-        # When curiosity was high and sensory input changes → small reward
-        curiosity_change = max(0.0, self._prev_cold - curiosity_now)  # Intentional: reuse pattern
-        # Actually: curiosity satisfaction from novelty
-        prev_curiosity = self._curiosity_drive  # Before update
-        curiosity_reward = 0.0
-        if sensor_readings is not None:
-            # Reward for experiencing something new
-            # (curiosity drive was high, now it dropped = we explored)
-            if self._sensory_ema > 0.05:
-                curiosity_reward = self.config.curiosity_weight * 0.1  # Gentle constant push
+        # ── Curiosity reward: small bonus for exploring ────
+        # Curiosity drive provides gentle exploration pressure
+        curiosity_reward = curiosity_now * self.config.curiosity_weight * 0.1
+        
+        # ── Wasteful movement penalty ────
+        # BIOLOGICAL: No drives = should rest (conserve energy!)
+        # If all drives are low AND agent moves, penalize it
+        max_drive = max(hunger_now, thirst_now, cold_now, curiosity_now)
+        wasteful_movement_penalty = 0.0
+        if max_drive < 0.3:  # All drives low
+            # Agent should rest, not wander aimlessly
+            # This penalty teaches energy conservation
+            wasteful_movement_penalty = -0.05
+        
+        # ── Surprise detection: big reward changes ────
+        # If reward changes dramatically from previous tick, agent was "surprised"
+        # This temporarily satisfies curiosity
+        current_reward_mag = abs(satisfaction + consumption_reward)
+        if hasattr(self, '_prev_reward_mag'):
+            surprise = abs(current_reward_mag - self._prev_reward_mag)
+            if surprise > 0.5:  # Significant surprise
+                self.reduce_curiosity_from_surprise(surprise=min(1.0, surprise))
+        self._prev_reward_mag = current_reward_mag
 
         # Small base survival signal (alive = slightly positive)
-        # This prevents total reward from being overwhelmingly negative at start
         alive_bonus = 0.02
 
         # ── Total internal reward ──────────────────────────────
-        total = satisfaction + discomfort + consumption_reward + curiosity_reward + alive_bonus
+        total = (satisfaction + discomfort + consumption_reward + 
+                curiosity_reward + wasteful_movement_penalty + alive_bonus)
 
         # Update stats
         self.total_satisfaction += satisfaction
@@ -306,7 +357,9 @@ class DriveSystem:
             'satisfaction': satisfaction,
             'discomfort': discomfort,
             'consumption_bonus': consumption_reward,
+            'consumed_type': consumed_resource if consumed_resource else '',  # FIX: Add consumed type!
             'curiosity_reward': curiosity_reward,
+            'wasteful_movement': wasteful_movement_penalty,
             'alive_bonus': alive_bonus,
             'total': total,
             'hunger_drive': hunger_now,
@@ -325,6 +378,7 @@ class DriveSystem:
         self._prev_hunger = 0.0
         self._prev_thirst = 0.0
         self._prev_cold = 0.0
+        self._curiosity_drive = 0.0  # Reset curiosity
         self._sensory_history.clear()
         self._sensory_ema = 0.0
         self._curiosity_drive = 0.5

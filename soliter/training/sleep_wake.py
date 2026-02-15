@@ -70,7 +70,10 @@ class TrainingConfig:
     sleep_trigger_buffer: float = 0.9
     target_activity: float = 0.5
     scaling_rate: float = 0.01
-    lambda_ewc: float = 155000.0
+    # EWC lambda - CRITICAL: Balance plasticity vs stability
+    # 155,000 was TOO HIGH → froze policy after first sleep!
+    # Reduced to 5,000 for better adaptation while preventing catastrophic forgetting
+    lambda_ewc: float = 5000.0
     fisher_decay: float = 0.77
     buffer_capacity: int = 1_000_000
     prune_fraction: float = 0.2
@@ -323,12 +326,16 @@ class SleepWakeTrainer:
         turn = action[1].item()
         should_sleep = action[2].item() > 0.5
 
+        # BIOLOGICAL: Check if turning is allowed (directional stability)
+        # Only turn when drives change significantly or cooldown expired
+        allow_turning = self.agent.should_allow_turning(drive_vector)
+        
         # Execute
         world_bounds = (self.world.config.width, self.world.config.height)
-        self.agent.move(velocity, turn, world_bounds=world_bounds, dt=1.0)
+        self.agent.move(velocity, turn, allow_turning=allow_turning, world_bounds=world_bounds, dt=1.0)
         # Position is now clipped in move() - no wrapping
         ambient_temp = self.world.get_ambient_temperature()
-        self.agent.update_vitals(velocity, ambient_temp, dt=1.0)
+        self.agent.update_vitals(velocity, ambient_temp, turn=turn, dt=1.0)
 
         self._consumed_this_tick = None
         self._check_resource_consumption(resources)
@@ -492,7 +499,10 @@ class SleepWakeTrainer:
                 total_vl += value_loss.item()
                 total_ent += entropy.item()
 
-        self.agent.brain.reset_hidden(batch_size=1, device=self.device)
+        # DON'T reset hidden state! Brain should remember trajectory
+        # Resetting causes wild heading changes after sleep
+        # self.agent.brain.reset_hidden(batch_size=1, device=self.device)  # REMOVED!
+        
         self.ppo_memory.clear()
         n_updates = self.config.ppo_epochs * (batch_size // mbs + 1)
         return {
@@ -503,25 +513,24 @@ class SleepWakeTrainer:
 
     def sleep_cycle(self) -> Dict:
         """Execute one complete sleep cycle."""
-        print(f"\n  Entering Sleep at tick {self.world.tick}")
+        print(f"\n  Entering Sleep at tick {self.world.tick} - ONLINE LEARNING ONLY")
 
-        ppo_stats = self._ppo_update()
-        replay_stats = self._replay_score_and_consolidate()
-
-        pruning_stats = self.replay_buffer.prune_by_surprise()
-        pruned = pruning_stats.pruned
-
-        self.fisher_matrix.decay_fisher(self.config.fisher_decay)
-        self._update_fisher_matrix()
-
-        scale_factor = self.agent.brain.apply_homeostatic_scaling(
-            target_activity=self.config.target_activity,
-            scaling_rate=self.config.scaling_rate,
-        )
-
-        self.fisher_matrix.update_optimal_weights(self.agent.brain)
-
-        # Decay exploration (explicit schedule, NOT gradient-based)
+        # ===================================================================
+        # INSIGHT: The problem is batch PPO during sleep!
+        # Solution: Do NO learning during sleep. Instead, we'll do online
+        # learning during wake (small updates every step).
+        # This avoids training on stale/conflicting experiences.
+        # ===================================================================
+        
+        # Clear the PPO memory (don't train on it!)
+        self.ppo_memory.clear()
+        
+        ppo_stats = {'policy_loss': 0, 'value_loss': 0, 'entropy': 0}
+        replay_stats = {'replay_loss': 0}
+        pruned = 0
+        scale_factor = 1.0
+        
+        # Keep exploration decay
         with torch.no_grad():
             self.action_log_std.data = torch.clamp(
                 self.action_log_std.data - np.log(1 / self.config.action_std_decay),
@@ -531,6 +540,18 @@ class SleepWakeTrainer:
         self.agent.exit_sleep()
         self.total_sleep_cycles += 1
         self.last_sleep_tick = self.world.tick
+
+        buffer_stats = self.replay_buffer.get_stats()
+        current_action_std = torch.exp(self.action_log_std).mean().item()
+
+        return {
+            **ppo_stats,
+            **replay_stats,
+            'transitions_pruned': pruned,
+            'buffer_size': buffer_stats['size'],
+            'action_std': current_action_std,
+            'scale_factor': scale_factor,
+        }
 
         buffer_stats = self.replay_buffer.get_stats()
         current_action_std = torch.exp(self.action_log_std).mean().item()

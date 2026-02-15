@@ -31,7 +31,19 @@ class VitalsConfig:
     
     # Movement parameters
     base_speed: float = 2.0
-    base_turn_rate: float = 0.1
+    # CRITICAL: Lower turn rate prevents wild spinning when exploring
+    # Old: 0.1 rad/tick = 5.7°/tick → 570°/100 ticks (excessive!)
+    # New: 0.03 rad/tick = 1.7°/tick → 170°/100 ticks (more realistic)
+    base_turn_rate: float = 0.03  # Reduced from 0.1 to prevent thrashing
+    
+    # Turn momentum - smooth out rapid direction changes
+    turn_momentum: float = 0.7  # 70% previous turn + 30% new turn
+    
+    # BIOLOGICAL: Directional stability (like vacuum cleaners!)
+    # Direction should only change when there's a REASON
+    # Not random oscillation from network noise
+    direction_stability_threshold: float = 0.15  # Drive must change >15% to allow turning
+    direction_change_cooldown: int = 50  # Minimum ticks between direction changes
     
     # Sleep threshold
     sleep_threshold: float = 0.3
@@ -74,6 +86,12 @@ class SoliterAgent:
         self.heading = 0.0  # Current heading in radians
         self.last_velocity = 0.0  # Last velocity magnitude
         self.last_delta = np.array([0.0, 0.0])  # Last movement vector
+        self.last_turn = 0.0  # Last turn rate (for momentum smoothing)
+        
+        # Directional stability (genetic memory - like vacuum cleaners!)
+        self.last_drive_state = np.array([0.0, 0.0, 0.0, 0.0])  # [hunger, thirst, cold, curiosity]
+        self.ticks_since_direction_change = 0
+        self.stable_direction = True
         
         # Vitals
         self.energy = config.initial_energy
@@ -94,15 +112,36 @@ class SoliterAgent:
         # Initialize brain hidden state
         self.brain.reset_hidden(batch_size=1, device=device)
     
-    def reset(self, position: Optional[np.ndarray] = None) -> None:
-        """Reset agent to initial state."""
+    def reset(self, position: Optional[np.ndarray] = None, after_death: bool = False) -> None:
+        """
+        Reset agent to initial state.
+        
+        Args:
+            position: Starting position (if None, use [0, 0])
+            after_death: If True, agent respawns with minimal resources (death penalty)
+        """
         self.position = position if position is not None else np.array([0.0, 0.0])
         self.rotation = 0.0
+        self.last_turn = 0.0  # Reset turn momentum
         
-        self.energy = self.config.initial_energy
-        self.hydration = self.config.initial_hydration
-        self.temperature = self.config.initial_temperature
-        self.wakefulness = self.config.initial_wakefulness
+        # Reset directional stability
+        self.last_drive_state = np.array([0.0, 0.0, 0.0, 0.0])
+        self.ticks_since_direction_change = 0
+        
+        if after_death:
+            # DEATH PENALTY: Respawn with barely enough to survive
+            # Prevents death exploitation - dying should NOT be a strategy!
+            # Agent gets 1/4 of initial resources - just enough to start searching
+            self.energy = self.config.initial_energy * 0.25  # 25% energy
+            self.hydration = self.config.initial_hydration * 0.25  # 25% hydration
+            self.temperature = self.config.initial_temperature  # Normal temp (37°C)
+            self.wakefulness = 0.5  # Groggy after death
+        else:
+            # Normal reset (first spawn)
+            self.energy = self.config.initial_energy
+            self.hydration = self.config.initial_hydration
+            self.temperature = self.config.initial_temperature
+            self.wakefulness = self.config.initial_wakefulness
         
         self.is_alive = True
         self.is_sleeping = False
@@ -177,40 +216,85 @@ class SoliterAgent:
         self,
         velocity: float,
         ambient_temperature: float,
+        turn: float = 0.0,
         dt: float = 1.0,
     ) -> None:
         """
         Update vitals based on actions and environment.
         
+        THERMAL SYSTEM (REVISED):
+        - Movement generates heat (slow accumulation)
+        - Asymmetric warming/cooling (easier to warm than cool)
+        - Time to critical: 80-140 ticks (not 10-14)
+        
         Args:
             velocity: Current movement speed
             ambient_temperature: Environmental temperature
+            turn: Turn rate (rotation cost)
             dt: Time step
         """
         if not self.is_alive:
             return
         
-        # Energy decay (faster when moving)
-        energy_decay = self.config.energy_decay_base * (1 + velocity ** 2)
+        # ═══════════════════════════════════════════════════════════
+        # ENERGY SYSTEM
+        # ═══════════════════════════════════════════════════════════
+        # Energy decay (faster when moving OR turning)
+        movement_cost = velocity ** 2
+        turning_cost = abs(turn) * 0.5  # Turning costs energy
+        energy_decay = self.config.energy_decay_base * (1 + movement_cost + turning_cost)
         self.energy -= energy_decay * dt
         
+        # ═══════════════════════════════════════════════════════════
+        # HYDRATION SYSTEM
+        # ═══════════════════════════════════════════════════════════
         # Hydration decay (faster when hot)
-        temp_stress = max(0, self.temperature - ambient_temperature)
-        hydration_decay = self.config.hydration_decay_base * (1 + temp_stress)
+        temp_stress = max(0, (self.temperature - 37.0) / 10.0)  # Normalized stress
+        hydration_decay = self.config.hydration_decay_base * (1 + temp_stress * 0.5)
         self.hydration -= hydration_decay * dt
         
-        # Temperature decay toward ambient
-        temp_diff = self.temperature - ambient_temperature
-        self.temperature -= self.config.temperature_decay_rate * temp_diff * dt
+        # ═══════════════════════════════════════════════════════════
+        # THERMAL SYSTEM (NEW - SLOW DYNAMICS)
+        # ═══════════════════════════════════════════════════════════
         
-        # Wakefulness decay (linear)
+        # 1. METABOLIC HEAT GENERATION (slow)
+        metabolic_base = 0.005  # Base metabolism (°C/tick)
+        
+        # Resting reduces metabolism
+        if velocity < 0.1 and abs(turn) < 0.05:
+            metabolic_base *= 0.5  # Half heat when resting
+        
+        # Movement generates heat (quadratic)
+        movement_heat = (velocity ** 2) * 0.01  # °C/tick
+        
+        # Rotation generates heat (linear)
+        rotation_heat = abs(turn) * 0.005  # °C/tick
+        
+        total_heat_production = metabolic_base + movement_heat + rotation_heat
+        
+        # 2. THERMAL EXCHANGE WITH ENVIRONMENT (symmetric & slower)
+        temp_diff = self.temperature - ambient_temperature
+        
+        # SYMMETRIC thermal exchange (was asymmetric, too harsh)
+        # Both warming and cooling use same rate
+        thermal_exchange = 0.004 * temp_diff  # Symmetric rate
+        
+        # 3. NET TEMPERATURE CHANGE
+        delta_temp = total_heat_production - thermal_exchange
+        self.temperature += delta_temp * dt
+        
+        # ═══════════════════════════════════════════════════════════
+        # WAKEFULNESS SYSTEM
+        # ═══════════════════════════════════════════════════════════
         if not self.is_sleeping:
             self.wakefulness -= self.config.wakefulness_decay_rate * dt
         
-        # Clamp vitals
+        # ═══════════════════════════════════════════════════════════
+        # CLAMP VITALS
+        # ═══════════════════════════════════════════════════════════
         self.energy = max(0.0, min(100.0, self.energy))
         self.hydration = max(0.0, min(100.0, self.hydration))
-        self.temperature = max(0.0, min(100.0, self.temperature))
+        self.temperature = max(0.0, min(150.0, self.temperature))
         self.wakefulness = max(0.0, min(1.0, self.wakefulness))
         
         # Check for death
@@ -230,6 +314,9 @@ class SoliterAgent:
             self.energy = min(100.0, self.energy + amount)
         elif resource_type == 'water':
             self.hydration = min(100.0, self.hydration + amount)
+            # NEW: Water provides cooling (evaporative cooling effect)
+            cooling_effect = amount * 0.15  # 15% of water amount cools body
+            self.temperature = max(0.0, self.temperature - cooling_effect)
         elif resource_type == 'heat':
             self.temperature = min(100.0, self.temperature + amount)
     
@@ -243,24 +330,72 @@ class SoliterAgent:
         self.is_sleeping = False
         self.wakefulness = 1.0
     
-    def move(self, velocity: float, turn: float, world_bounds: Tuple[float, float] = None, dt: float = 1.0) -> None:
+    def should_allow_turning(self, current_drives: np.ndarray) -> bool:
+        """
+        BIOLOGICAL: Direction stability - like vacuum cleaners!
+        
+        Only allow turning when there's a REASON:
+        1. Drives changed significantly (new goal)
+        2. Been going straight long enough (cooldown expired)
+        3. Near obstacle/wall
+        
+        This prevents constant oscillation from network noise.
+        
+        Args:
+            current_drives: [hunger, thirst, cold, curiosity]
+            
+        Returns:
+            True if turning is allowed, False if should go straight
+        """
+        # Always allow turning if cooldown expired
+        if self.ticks_since_direction_change >= self.config.direction_change_cooldown:
+            return True
+        
+        # Check if any drive changed significantly
+        drive_changes = np.abs(current_drives - self.last_drive_state)
+        max_drive_change = np.max(drive_changes)
+        
+        if max_drive_change > self.config.direction_stability_threshold:
+            # Significant drive change → new goal → allow turning
+            self.last_drive_state = current_drives.copy()
+            self.ticks_since_direction_change = 0
+            return True
+        
+        # No significant change → maintain direction
+        self.ticks_since_direction_change += 1
+        return False
+    
+    def move(self, velocity: float, turn: float, allow_turning: bool = True, world_bounds: Tuple[float, float] = None, dt: float = 1.0) -> None:
         """
         Update position based on velocity and turn rate.
         
         Args:
             velocity: Forward velocity
             turn: Turn rate (radians per tick)
+            allow_turning: If False, suppress turning (directional stability)
             world_bounds: (width, height) of world for boundary enforcement
             dt: Time step
         """
         if self.is_sleeping or not self.is_alive:
             self.last_velocity = 0.0
             self.last_delta = np.array([0.0, 0.0])
+            self.last_turn = 0.0
             self.heading = self.rotation
             return
         
-        # Update rotation
-        self.rotation += turn * dt
+        # BIOLOGICAL: Directional stability
+        # If not allowed to turn, suppress turn command (go straight)
+        if not allow_turning:
+            turn = 0.0  # Override network output - maintain direction!
+        
+        # CRITICAL: Apply turn momentum to smooth out rapid direction changes
+        # Biological organisms have inertia - can't instantly reverse direction
+        # This prevents wild thrashing/spinning behavior
+        smoothed_turn = self.config.turn_momentum * self.last_turn + (1 - self.config.turn_momentum) * turn
+        self.last_turn = smoothed_turn
+        
+        # Update rotation with smoothed turn
+        self.rotation += smoothed_turn * dt
         self.rotation = self.rotation % (2 * np.pi)
         
         # Track heading and velocity for logging
@@ -280,17 +415,26 @@ class SoliterAgent:
             self.position[1] = np.clip(self.position[1], 0, world_height - 1)
     
     def _check_death(self) -> None:
-        """Check if any vital has reached 0 (death condition)."""
+        """
+        Check if any vital has reached critical threshold (death condition).
+        
+        Temperature zones:
+        - Below 15°C: Hypothermia death
+        - 15-20°C: Danger (very cold)
+        - 20-42°C: Safe range
+        - 42-45°C: Danger (very hot)
+        - Above 45°C: Hyperthermia death
+        """
         if self.energy <= 0:
             self.is_alive = False
             self.cause_of_death = "starvation"
         elif self.hydration <= 0:
             self.is_alive = False
             self.cause_of_death = "dehydration"
-        elif self.temperature <= 0:
+        elif self.temperature <= 15.0:  # Hypothermia threshold (was 0)
             self.is_alive = False
             self.cause_of_death = "hypothermia"
-        elif self.temperature >= 100:
+        elif self.temperature >= 45.0:  # Hyperthermia threshold (was 100)
             self.is_alive = False
             self.cause_of_death = "hyperthermia"
     

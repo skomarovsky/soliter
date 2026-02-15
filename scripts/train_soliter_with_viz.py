@@ -35,7 +35,7 @@ from soliter.environment import (
     create_default_resources,
     Physics, SensorSystem, SensorConfig,
 )
-from soliter.training import SleepWakeTrainer, TrainingConfig
+from soliter.training.sleep_wake_ncp import NCPSleepWakeTrainer, NCPTrainerConfig
 
 
 # ===================================================================
@@ -195,75 +195,125 @@ class Visualizer:
         self.small_font = pygame.font.Font(None, 18)
         
     def draw(self, agent, resources, world, trainer, cycle, step, total_consumptions, last_reward_details):
-        self.screen.fill(BLACK)
+        # Background: LIGHT BLUE during day, dark at night
+        is_night = world.is_night()
+        season = world.get_season()
         
-        # Draw resources with depletion visualization
-        # Two circles: detection radius (thin) and consumption radius (thicker)
+        if is_night:
+            # Night: Dark backgrounds
+            if season.value == 'SUMMER':
+                background = (20, 20, 60)  # Dark blue
+            elif season.value == 'WINTER':
+                background = (10, 10, 10)  # Black
+            elif season.value == 'SPRING':
+                background = (30, 30, 50)  # Dark grey-blue
+            else:  # AUTUMN
+                background = (40, 30, 30)  # Dark brownish
+        else:
+            # Day: LIGHT BLUE (easy on eyes, good contrast)
+            background = (173, 216, 230)  # Light blue
+        
+        self.screen.fill(background)
+        
+        # Draw feeders (food) with % indicator
         for feeder in resources.get('feeders', []):
             pos = (int(feeder.position[0] * self.scale), int(feeder.position[1] * self.scale))
             
-            # Depletion ratio: 1.0 = full (bright), 0.0 = empty (dim)
+            # Depletion ratio
             depletion = feeder.get_depletion_ratio()
             color_intensity = int(255 * depletion)
-            color = (0, color_intensity, 0)  # Fade from dark to bright green
+            color = (0, color_intensity, 0) if depletion > 0 else (50, 50, 50)
             
-            # Detection radius (very thin, light green) - gradient sensing range
+            # Detection radius (thin)
             detection_radius = int(feeder.get_detection_radius(False) * self.scale)
-            pygame.draw.circle(self.screen, (150, 255, 150), pos, detection_radius, 1)
+            pygame.draw.circle(self.screen, (100, 200, 100), pos, detection_radius, 1)
             
-            # Consumption radius (thicker, bright green) - MUST BE THIS CLOSE
+            # Consumption radius
             consumption_radius = int(feeder.get_consumption_radius(False) * self.scale)
-            pygame.draw.circle(self.screen, GREEN, pos, consumption_radius, 3)
+            pygame.draw.circle(self.screen, color, pos, consumption_radius, 2)
             
-            # Resource dot (the actual resource) - SMALL and visible
-            pygame.draw.circle(self.screen, GREEN, pos, 5)
+            # Resource center dot
+            pygame.draw.circle(self.screen, color, pos, 4)
+            
+            # Show % available (instead of bar)
+            percent = int(depletion * 100)
+            if percent < 100:  # Only show if not full
+                text = self.small_font.render(f'{percent}%', True, (0, 0, 0) if not is_night else (255, 255, 255))
+                self.screen.blit(text, (pos[0] + 8, pos[1] - 8))
+            
             
             # Show depletion percentage as text
             if depletion < 0.3:  # Only show when getting low
                 text = self.small_font.render(f'{int(depletion*100)}%', True, ORANGE)
                 self.screen.blit(text, (pos[0] + 8, pos[1] - 8))
-            
+        
+        # Draw fountains (water) with % indicator
         for fountain in resources.get('fountains', []):
             pos = (int(fountain.position[0] * self.scale), int(fountain.position[1] * self.scale))
             
             depletion = fountain.get_depletion_ratio()
             color_intensity = int(255 * depletion)
-            color = (0, int(color_intensity * 0.4), color_intensity)  # Fade blue
+            color = (0, int(color_intensity * 0.6), color_intensity) if depletion > 0 else (0, 50, 50)
             
-            # Detection radius (thin, light blue)
+            # Detection radius
             detection_radius = int(fountain.get_detection_radius(False) * self.scale)
-            pygame.draw.circle(self.screen, (150, 200, 255), pos, detection_radius, 1)
+            pygame.draw.circle(self.screen, (100, 150, 200), pos, detection_radius, 1)
             
-            # Consumption radius (thick, bright blue)
+            # Consumption radius
             consumption_radius = int(fountain.get_consumption_radius(False) * self.scale)
-            pygame.draw.circle(self.screen, BLUE, pos, consumption_radius, 3)
+            pygame.draw.circle(self.screen, color, pos, consumption_radius, 2)
             
-            pygame.draw.circle(self.screen, BLUE, pos, 5)
+            # Resource center
+            pygame.draw.circle(self.screen, color, pos, 4)
             
-            if depletion < 0.3:
-                text = self.small_font.render(f'{int(depletion*100)}%', True, ORANGE)
+            # Show % available
+            percent = int(depletion * 100)
+            if percent < 100:
+                text = self.small_font.render(f'{percent}%', True, (0, 0, 0) if not is_night else (255, 255, 255))
                 self.screen.blit(text, (pos[0] + 8, pos[1] - 8))
             
+        # Draw heaters with day/night behavior
+        is_night = world.is_night()
         for heater in resources.get('heaters', []):
             pos = (int(heater.position[0] * self.scale), int(heater.position[1] * self.scale))
             
-            depletion = heater.get_depletion_ratio()
-            color_intensity = int(255 * depletion)
-            color = (color_intensity, 0, 0)  # Fade from dark to bright red
-            
-            # Detection radius (thin, pink)
-            detection_radius = int(heater.get_detection_radius(False) * self.scale)
-            pygame.draw.circle(self.screen, (255, 150, 150), pos, detection_radius, 1)
-            
-            # Consumption radius (thick, bright red)
-            consumption_radius = int(heater.get_consumption_radius(False) * self.scale)
-            pygame.draw.circle(self.screen, RED, pos, consumption_radius, 3)
-            
-            pygame.draw.circle(self.screen, RED, pos, 5)
-            
-            if depletion < 0.3:
-                text = self.small_font.render(f'{int(depletion*100)}%', True, ORANGE)
-                self.screen.blit(text, (pos[0] + 8, pos[1] - 8))
+            if is_night:
+                # NIGHT: Active heater
+                depletion = heater.get_depletion_ratio()
+                color_intensity = int(255 * depletion)
+                color = (color_intensity, int(color_intensity * 0.5), 0) if depletion > 0 else (50, 25, 0)
+                
+                # Detection radius
+                detection_radius = int(heater.get_detection_radius(is_night) * self.scale)
+                pygame.draw.circle(self.screen, (255, 200, 150), pos, detection_radius, 1)
+                
+                # Consumption radius
+                consumption_radius = int(heater.get_consumption_radius(is_night) * self.scale)
+                pygame.draw.circle(self.screen, color, pos, consumption_radius, 2)
+                
+                # Center
+                pygame.draw.circle(self.screen, color, pos, 4)
+                
+                # Show % available (instead of bar)
+                percent = int(depletion * 100)
+                if percent < 100:  # Only show if not full
+                    text = self.small_font.render(f'{percent}%', True, (255, 255, 255))
+                    self.screen.blit(text, (pos[0] + 8, pos[1] - 8))
+            else:
+                # DAY: Inactive (small brown dot - just an obstacle marker)
+                obstacle_color = (139, 90, 43)  # Brown
+                # Small dot (radius 3) instead of full consumption circle
+                pygame.draw.circle(self.screen, obstacle_color, pos, 3)
+                
+                # Tiny X to show inactive
+                x_size = 2
+                x_color = (90, 60, 30)
+                pygame.draw.line(self.screen, x_color, 
+                               (pos[0]-x_size, pos[1]-x_size), 
+                               (pos[0]+x_size, pos[1]+x_size), 1)
+                pygame.draw.line(self.screen, x_color, 
+                               (pos[0]+x_size, pos[1]-x_size), 
+                               (pos[0]-x_size, pos[1]+x_size), 1)
         
         # Draw agent - OUTLINE ONLY with direction arrow
         agent_pos = (int(agent.position[0] * self.scale), int(agent.position[1] * self.scale))
@@ -341,14 +391,33 @@ class Visualizer:
                 ('Hunger', last_reward_details.get('hunger_drive', 0), ORANGE),
                 ('Thirst', last_reward_details.get('thirst_drive', 0), BLUE),
                 ('Cold', last_reward_details.get('cold_drive', 0), CYAN),
+                ('Curiosity', last_reward_details.get('curiosity_drive', 0), (255, 255, 0)),  # Yellow
             ]
             
             for drive_name, drive_val, drive_color in drives:
+                # Label FIRST (on the left) - with dark background for contrast
+                label_text = f"{drive_name}:"
+                text_surface = self.font.render(label_text, True, WHITE)
+                text_width = text_surface.get_width()
+                
+                # Dark background behind label
+                label_bg_rect = pygame.Rect(x_offset - text_width - 10, y_offset - 2, text_width + 5, bar_height + 4)
+                pygame.draw.rect(self.screen, (30, 30, 30), label_bg_rect)
+                
+                # Render label text on the left
+                self.screen.blit(text_surface, (x_offset - text_width - 5, y_offset))
+                
+                # Drive bar (to the right of label)
+                # Background bar (empty portion)
                 pygame.draw.rect(self.screen, GRAY, (x_offset, y_offset, vital_width, bar_height))
+                # Filled portion (drive level)
                 pygame.draw.rect(self.screen, drive_color, (x_offset, y_offset, int(vital_width * drive_val), bar_height))
-                text = self.small_font.render(f"{drive_name}: {drive_val:.2f}", True, WHITE)
-                self.screen.blit(text, (x_offset + 210, y_offset))
-                y_offset += 20
+                
+                # Value text on the right of bar
+                value_text = self.small_font.render(f"{drive_val:.2f}", True, WHITE)
+                self.screen.blit(value_text, (x_offset + vital_width + 5, y_offset + 2))
+                
+                y_offset += 25  # More spacing
         
         pygame.display.flip()
         
@@ -420,6 +489,8 @@ def main():
     sensors = SensorSystem(config=sensor_config, physics=physics)
     
     brain = CfCBrain(sensory_size=51)
+    brain = brain.to(device)  # CRITICAL: Move to CUDA!
+    
     vitals_config = VitalsConfig(
         initial_energy=config.agent.initial_energy,
         initial_hydration=config.agent.initial_hydration,
@@ -441,17 +512,18 @@ def main():
     
     last_death_location = agent.position.copy()
     
-    training_config = TrainingConfig(
+    # Initialize NCP trainer (NO PPO!)
+    ncp_config = NCPTrainerConfig(
+        world_width=world_width,
+        world_height=world_height,
         wake_duration=args.wake_steps,
-        learning_rate=config.training.learning_rate,
-        batch_size=config.memory.batch_size,
-        sleep_epochs=config.training.sleep_epochs,
-        lambda_ewc=config.memory.ewc_lambda,
-        fisher_decay=config.memory.fisher_decay,
-        buffer_capacity=config.memory.buffer_max_size,
+        initial_action_std=0.5,
+        action_std_min=0.05,
+        action_std_decay=0.995,
     )
     
-    trainer = SleepWakeTrainer(agent, world, sensors, physics, training_config, device)
+    trainer = NCPSleepWakeTrainer(agent, world, ncp_config, device)
+    
     
     # Visualization
     viz = Visualizer(world_width, world_height, scale=4)
@@ -476,9 +548,16 @@ def main():
                 if not running:
                     break
                 
+                # Update world
+                world.step()
+                
+                # CRITICAL FIX: Update all resources (recovery)
+                for resource_list in resources.values():
+                    for resource in resource_list:
+                        resource.update(world.tick)
+                
                 # Training step
                 reward, done, reward_details = trainer.wake_step(resources)
-                world.step()
                 last_reward_details = reward_details
                 
                 if reward_details.get('consumption_bonus', 0) > 0:
@@ -549,9 +628,11 @@ def main():
                         life_duration=life_duration,
                     )))
                     
-                    agent.reset()
-                    agent.position = last_death_location + np.random.uniform(-20, 20, size=2)
-                    agent.position = np.clip(agent.position, 0, [world_width - 1, world_height - 1])
+                    # CRITICAL: Respawn at EXACT death location with minimal resources
+                    # This prevents death exploitation - dying is now punishing!
+                    death_position = last_death_location.copy()
+                    agent.reset(position=death_position, after_death=True)
+                    # Position already set in reset(), don't modify it!
                     trainer.drive_system.reset()
                     cycle_start_life = world.tick
             
@@ -560,7 +641,7 @@ def main():
             
             # Sleep - log sleep event
             print(f"Cycle {cycle:3d}: Consumptions={cycle_consumptions:2d}, "
-                  f"Total={total_consumptions:3d}, Buffer={len(trainer.replay_buffer):5d}")
+                  f"Total={total_consumptions:3d}")
             
             sleep_metrics = trainer.sleep_cycle()
             
@@ -568,7 +649,7 @@ def main():
             training_log.sleeps.append(asdict(SleepEvent(
                 tick=world.tick,
                 cycle=cycle,
-                buffer_size=len(trainer.replay_buffer),
+                buffer_size=0,  # NCP has no replay buffer
                 pruned=sleep_metrics.get('pruned', 0),
                 surprise_min=float(sleep_metrics.get('surprise_min', 0.0)),
                 surprise_mean=float(sleep_metrics.get('surprise_mean', 0.0)),

@@ -40,10 +40,11 @@ class WorldConfig:
     seasonal_period: int = 20000  # 1 year
     diurnal_period: int = 2000    # 1 day
     
-    # Temperature parameters
-    base_temperature: float = 37.0  # Comfortable baseline
-    seasonal_amplitude: float = 30.0  # ±30°C seasonal variation
-    diurnal_amplitude: float = 10.0   # ±10°C day/night variation
+    # Temperature parameters (REVISED - less extreme)
+    base_temperature: float = 30.0    # Moderate baseline
+    seasonal_amplitude: float = 10.0  # ±10°C seasonal (was 15, too harsh)
+    diurnal_amplitude: float = 5.0    # ±5°C day/night (was 10)
+    # Result: Summer 2pm = 45°C, Winter 2am = 15°C (more survivable)
     
     # Night definition (fraction of day that's night)
     night_fraction: float = 0.4

@@ -168,14 +168,19 @@ class GradientSensors:
     ) -> np.ndarray:
         """
         Compute gradient toward the nearest resource in a list.
-
-        Returns: [gx, gy] — direction * strength
+        
+        BIOLOGICAL REALISM: Gradients only exist WITHIN detection range!
+        Beyond detection range, agent gets NO directional signal.
+        This forces exploration behavior (like bacteria/animals).
+        
+        Returns: [gx, gy] — direction * strength, or [0, 0] if nothing in range
         """
         if not resource_list:
             return np.zeros(2, dtype=np.float32)
 
         best_dist = float('inf')
         best_direction = np.zeros(2)
+        best_detection_radius = 0.0
 
         for resource in resource_list:
             r_pos = resource.position
@@ -190,16 +195,28 @@ class GradientSensors:
                 dy = r_pos[1] - agent_pos[1]
 
             dist = np.sqrt(dx**2 + dy**2)
+            
+            # Get detection radius for this resource
+            detection_radius = resource.get_detection_radius()
 
-            if dist < best_dist:
+            # CRITICAL: Only sense resources WITHIN detection range!
+            # Beyond this, agent gets NO signal → must explore randomly
+            if dist <= detection_radius and dist < best_dist:
                 best_dist = dist
+                best_detection_radius = detection_radius
                 if dist > 1e-6:
                     best_direction = np.array([dx / dist, dy / dist])
                 else:
                     best_direction = np.zeros(2)
 
-        # Inverse distance strength
-        strength = 1.0 / (1.0 + best_dist / self.config.scale_factor)
+        # If nothing in range, return zero gradient (no signal!)
+        if best_dist == float('inf'):
+            return np.zeros(2, dtype=np.float32)
+
+        # Inverse distance strength (stronger when closer)
+        # Strength drops from 1.0 (at resource) to 0.0 (at detection boundary)
+        strength = 1.0 - (best_dist / best_detection_radius)
+        strength = max(0.0, min(1.0, strength))  # Clamp [0, 1]
 
         return (best_direction * strength).astype(np.float32)
 
