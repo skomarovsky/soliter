@@ -51,7 +51,7 @@ class NCPTrainerConfig:
     learning_rate: float = 0.0001  # For potential weight updates
     
     # Exploration
-    initial_action_std: float = 0.5
+    initial_action_std: float = 0.8  # INCREASED: More exploration to discover consumption
     action_std_min: float = 0.05
     action_std_decay: float = 0.995  # Slower decay for continuous learning
     
@@ -107,6 +107,25 @@ class NCPSleepWakeTrainer:
             nn.Linear(32, 1)
         ).to(device)
         
+        # CRITICAL FIX: ADD OPTIMIZER FOR LEARNING!
+        # Combine brain and value head parameters
+        all_params = list(self.agent.brain.parameters()) + list(self.value_head.parameters())
+        self.optimizer = torch.optim.Adam(all_params, lr=config.learning_rate)
+        
+        # Learning diagnostics
+        self.learning_diagnostics = {
+            'total_updates': 0,
+            'weight_changes': [],
+            'losses': [],
+            'gradient_norms': [],
+        }
+        
+        # Store initial weights for comparison
+        self.initial_weights = {
+            name: param.clone().detach()
+            for name, param in self.agent.brain.named_parameters()
+        }
+        
         # Track sleep cycles
         self.total_sleep_cycles = 0
         self.last_sleep_tick = 0
@@ -145,36 +164,37 @@ class NCPSleepWakeTrainer:
             world_height=float(self.world.config.height),
         ).to(self.device)
     
-    def _select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Select action using CfC network output + exploration noise.
+        Select action using CfC network + Gaussian policy.
         
-        NO PPO! Just network forward pass with gaussian noise for exploration.
+        Returns: (action, value, log_prob) for REINFORCE learning
         """
-        with torch.no_grad():
-            # CfC network produces mean action
-            mean_action, _ = self.agent.brain(state.unsqueeze(0))
-            mean_action = mean_action.squeeze(0)
-            
-            # Add exploration noise
-            action_std = torch.exp(self.action_log_std)
-            noise = torch.randn_like(mean_action) * action_std
-            action = mean_action + noise
-            
-            # Clamp to valid range
-            action = torch.clamp(action, -1.0, 1.0)
-            
-            # Transform to action space
-            action_constrained = torch.stack([
-                torch.sigmoid(action[0]),  # velocity [0, 1]
-                torch.tanh(action[1]),     # turn [-1, 1]
-                torch.sigmoid(action[2]),  # sleep [0, 1]
-            ])
-            
-            # Get value estimate (for logging/curiosity)
-            value = self.value_head(state)
+        # CfC network produces mean action (KEEP GRADIENTS!)
+        mean_action, _ = self.agent.brain(state.unsqueeze(0))
+        mean_action = mean_action.squeeze(0)
         
-        return action_constrained, value
+        # Create Gaussian distribution
+        action_std = torch.exp(self.action_log_std)
+        action_dist = torch.distributions.Normal(mean_action, action_std)
+        
+        # Sample action
+        sampled_action = action_dist.sample()
+        
+        # Compute log probability for REINFORCE
+        log_prob = action_dist.log_prob(sampled_action).sum()
+        
+        # Constrain to valid ranges
+        action_constrained = torch.stack([
+            torch.sigmoid(sampled_action[0]),  # velocity [0, 1]
+            torch.tanh(sampled_action[1]) * 0.3,  # turn [-0.3, 0.3] rad
+            torch.sigmoid(sampled_action[2]),  # sleep [0, 1]
+        ])
+        
+        # Get value estimate (KEEP GRADIENTS!)
+        value = self.value_head(state)
+        
+        return action_constrained, value, log_prob
     
     def _check_resource_consumption(self, resources: Dict):
         """Check if agent consumed a resource this tick."""
@@ -238,8 +258,16 @@ class NCPSleepWakeTrainer:
         sensor_noise = self.agent.get_sensor_noise()
         sensors = self._get_sensors(resources, drive_vector, sensor_noise)
         
-        # Select action (NCP forward pass + exploration)
-        action, value = self._select_action(sensors)
+        # Update stuck detection (track position + gradient strength)
+        # Extract gradient channels from sensors
+        gradient_channels = sensors[41:47]  # [food_x, food_y, water_x, water_y, heat_x, heat_y]
+        # Convert to CPU for numpy operations
+        gradient_channels_cpu = gradient_channels.cpu() if gradient_channels.is_cuda else gradient_channels
+        gradient_strength = np.linalg.norm(gradient_channels_cpu.numpy())
+        self.drive_system.update_position(self.agent.position, gradient_strength)
+        
+        # Select action (NCP forward pass + Gaussian sampling)
+        action, value, log_prob = self._select_action(sensors)
         velocity = action[0].item()
         turn = action[1].item()
         should_sleep = action[2].item() > 0.5
@@ -275,6 +303,101 @@ class NCPSleepWakeTrainer:
             consumed_resource=self._consumed_this_tick,
             is_dead=done,
         )
+        
+        # NOTE: No action penalties here!
+        # The DRIVE SYSTEM handles behavior through goal commitment.
+        # Agent commits to one drive and sticks with it for 100 ticks.
+        
+        # SHAPED REWARD: Guide agent to get VERY close to resources
+        if not done and resources:
+            # Find closest resource (any type)
+            min_distance = float('inf')
+            for resource_type, resource_list in resources.items():
+                for resource in resource_list:
+                    dist = np.linalg.norm(self.agent.position - resource.position)
+                    min_distance = min(min_distance, dist)
+            
+            # Proximity reward: Guide to consumption radius
+            if min_distance < 30.0:  # Within detection radius
+                # Gentle gradient: 0 at 30 units → 0.5 at 0 units
+                proximity_bonus = 0.5 * (1.0 - min_distance / 30.0)
+                reward += proximity_bonus
+                
+                # STRONG bonus for being VERY close (consumption range)
+                if min_distance < 5.0:
+                    # Strong gradient: 0 at 5 units → 3.0 at 0 units
+                    consumption_distance_bonus = 3.0 * (1.0 - min_distance / 5.0)
+                    reward += consumption_distance_bonus
+        
+        # CRITICAL FIX: ACTUALLY UPDATE NETWORK WEIGHTS!
+        # Use REINFORCE policy gradient + value learning
+        if not done:
+            reward_tensor = torch.tensor([reward], dtype=torch.float32, device=self.device)
+            
+            # 1. VALUE LOSS: Train value head to predict rewards
+            value_loss = (value.squeeze() - reward_tensor) ** 2
+            
+            # 2. POLICY LOSS: REINFORCE Policy Gradient
+            # Advantage = how much better than expected
+            advantage = reward_tensor - value.squeeze().detach()
+            
+            # REINFORCE: maximize log_prob weighted by advantage
+            # Positive advantage → increase probability of this action
+            # Negative advantage → decrease probability of this action
+            policy_loss = -log_prob * advantage
+            
+            # 3. ENTROPY BONUS: Encourage exploration
+            # Compute entropy of action distribution
+            action_std = torch.exp(self.action_log_std)
+            entropy = 0.5 * torch.log(2 * np.pi * np.e * (action_std ** 2)).sum()
+            entropy_bonus = -0.01 * entropy  # Small bonus for high entropy
+            
+            # 4. TOTAL LOSS
+            total_loss = policy_loss + value_loss + entropy_bonus
+            
+            # Backpropagate
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            
+            # Clip gradients to prevent explosions
+            torch.nn.utils.clip_grad_norm_(self.agent.brain.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.value_head.parameters(), max_norm=1.0)
+            
+            # Update weights
+            self.optimizer.step()
+            
+            # DIAGNOSTICS: Track learning
+            self.learning_diagnostics['total_updates'] += 1
+            self.learning_diagnostics['losses'].append(total_loss.item())
+            
+            # Every 100 updates, check weight changes
+            if self.learning_diagnostics['total_updates'] % 100 == 0:
+                total_change = 0.0
+                total_grad_norm = 0.0
+                
+                for name, param in self.agent.brain.named_parameters():
+                    if name in self.initial_weights:
+                        change = (param - self.initial_weights[name]).abs().mean().item()
+                        total_change += change
+                    
+                    if param.grad is not None:
+                        total_grad_norm += param.grad.norm().item()
+                
+                self.learning_diagnostics['weight_changes'].append(total_change)
+                self.learning_diagnostics['gradient_norms'].append(total_grad_norm)
+                
+                # Print diagnostics
+                updates = self.learning_diagnostics['total_updates']
+                avg_loss = np.mean(self.learning_diagnostics['losses'][-100:])
+                print(f"\n  📊 Learning Diagnostics (update {updates}):")
+                print(f"     Loss: {avg_loss:.4f}")
+                print(f"     Weight change: {total_change:.6f}")
+                print(f"     Gradient norm: {total_grad_norm:.4f}")
+                
+                if total_change < 0.0001:
+                    print(f"     ⚠️  WARNING: Weights barely changing!")
+                if total_grad_norm < 0.001:
+                    print(f"     ⚠️  WARNING: Gradients very small!")
         
         return reward, done, reward_details
     
@@ -313,3 +436,58 @@ class NCPSleepWakeTrainer:
             'action_std': current_action_std,
             'sleep_cycles': self.total_sleep_cycles,
         }
+    
+    def print_learning_summary(self):
+        """Print summary of learning diagnostics."""
+        print("\n" + "=" * 80)
+        print("LEARNING DIAGNOSTICS SUMMARY")
+        print("=" * 80)
+        
+        updates = self.learning_diagnostics['total_updates']
+        print(f"\nTotal weight updates: {updates}")
+        
+        if updates == 0:
+            print("❌ NO LEARNING HAPPENED - weights were never updated!")
+            return
+        
+        if self.learning_diagnostics['losses']:
+            losses = self.learning_diagnostics['losses']
+            print(f"\nLoss:")
+            print(f"  Initial: {losses[0]:.4f}")
+            print(f"  Final:   {losses[-1]:.4f}")
+            print(f"  Average: {np.mean(losses):.4f}")
+            
+            if len(losses) > 100:
+                early_avg = np.mean(losses[:100])
+                late_avg = np.mean(losses[-100:])
+                print(f"  Early avg: {early_avg:.4f}")
+                print(f"  Late avg:  {late_avg:.4f}")
+                improvement = early_avg - late_avg
+                print(f"  Improvement: {improvement:+.4f}")
+                
+                if improvement < 0.01:
+                    print(f"  ⚠️  Loss not decreasing - learning might not be working!")
+        
+        if self.learning_diagnostics['weight_changes']:
+            changes = self.learning_diagnostics['weight_changes']
+            print(f"\nWeight changes:")
+            print(f"  Total change from initial: {changes[-1]:.6f}")
+            
+            if changes[-1] < 0.001:
+                print(f"  ❌ Weights barely changed - learning is broken!")
+            elif changes[-1] < 0.01:
+                print(f"  ⚠️  Small weight changes - learning very slow")
+            else:
+                print(f"  ✅ Weights are updating")
+        
+        if self.learning_diagnostics['gradient_norms']:
+            grads = self.learning_diagnostics['gradient_norms']
+            print(f"\nGradient norms:")
+            print(f"  Average: {np.mean(grads):.4f}")
+            
+            if np.mean(grads) < 0.01:
+                print(f"  ⚠️  Very small gradients - might have vanishing gradient problem")
+            else:
+                print(f"  ✅ Gradients flowing")
+        
+        print("\n" + "=" * 80)

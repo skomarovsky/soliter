@@ -69,7 +69,7 @@ class DriveConfig:
     # Resource consumption bonus
     # Extra satisfaction when actually consuming a resource
     # (on top of drive reduction from vitals change)
-    consumption_bonus: float = 2.0
+    consumption_bonus: float = 10.0  # INCREASED: Makes consumption highly rewarding
 
 
 class DriveSystem:
@@ -114,6 +114,19 @@ class DriveSystem:
         self._sensory_ema: float = 0.0   # Exponential moving avg of sensory variance
         self._curiosity_drive: float = 0.5  # Start with moderate curiosity
 
+        # GOAL COMMITMENT: Once agent picks a drive, stick with it!
+        # This prevents oscillating between food/water when both needed
+        self._committed_drive: str = None  # 'hunger', 'thirst', or 'cold'
+        self._commitment_ticks: int = 0
+        self._commitment_duration: int = 100  # Ticks to stay committed
+        
+        # STUCK DETECTION: Track if agent not making progress
+        # If no gradient AND not moving → create "escape" drive
+        self._position_history: list = []  # Last N positions
+        self._history_length: int = 20  # Ticks to check
+        self._stuck_threshold: float = 5.0  # Total movement < this = stuck
+        self._is_stuck: bool = False
+        
         # Statistics
         self.total_satisfaction: float = 0.0
         self.total_discomfort: float = 0.0
@@ -221,18 +234,113 @@ class DriveSystem:
     def get_drive_vector(self, energy: float, hydration: float,
                          temperature: float, sensor_readings: np.ndarray = None) -> np.ndarray:
         """
-        Get drive states as a numpy vector for sensor input.
+        Get drive states as a numpy vector for sensor input WITH COMMITMENT.
+        
+        Once agent commits to a drive (e.g., hunger), that drive is boosted
+        and others are suppressed for N ticks. This prevents oscillation!
+        
+        CRITICAL: If agent is STUCK (no progress + no gradients), force exploration!
 
         Returns: array of shape (4,) — [hunger, thirst, cold, curiosity]
         Normalized to [0, 1].
         """
         drives = self.get_drives(energy, hydration, temperature, sensor_readings)
-        return np.array([
-            drives['hunger'],
-            drives['thirst'],
-            drives['cold'],
-            drives['curiosity'],
-        ], dtype=np.float32)
+        hunger = drives['hunger']
+        thirst = drives['thirst']
+        cold = drives['cold']
+        curiosity = drives['curiosity']
+        
+        # STUCK ESCAPE: If agent stuck in place, FORCE movement!
+        if self._is_stuck:
+            # Override all drives - exploration is URGENT
+            curiosity = 1.0  # Maximum exploration
+            # Suppress survival drives (they're not working anyway)
+            hunger *= 0.1
+            thirst *= 0.1
+            cold *= 0.1
+            # Clear commitment (it's not helping)
+            self._committed_drive = None
+            self._commitment_ticks = 0
+        else:
+            # Normal operation: Update commitment state
+            self._update_commitment(hunger, thirst, cold)
+            
+            # Apply commitment boost/suppression
+            if self._committed_drive and self._commitment_ticks > 0:
+                if self._committed_drive == 'hunger':
+                    hunger *= 3.0  # Boost committed drive
+                    thirst *= 0.05  # Strongly suppress others
+                    cold *= 0.05
+                elif self._committed_drive == 'thirst':
+                    hunger *= 0.05
+                    thirst *= 3.0
+                    cold *= 0.05
+                elif self._committed_drive == 'cold':
+                    hunger *= 0.05
+                    thirst *= 0.05
+                    cold *= 3.0
+                
+                # Clip to [0, 1]
+                hunger = min(1.0, hunger)
+                thirst = min(1.0, thirst)
+                cold = min(1.0, cold)
+        
+        return np.array([hunger, thirst, cold, curiosity], dtype=np.float32)
+    
+    def _update_commitment(self, hunger: float, thirst: float, cold: float):
+        """
+        Update commitment state based on drive levels.
+        
+        Rules:
+        1. If no commitment and a drive > 0.3, commit to strongest
+        2. If committed, decrement counter
+        3. If committed drive satisfied (< 0.1), release commitment
+        4. Emergency override: If another drive >> committed drive, switch
+        """
+        # Count down commitment timer
+        if self._commitment_ticks > 0:
+            self._commitment_ticks -= 1
+        
+        # Check if committed drive is satisfied
+        if self._committed_drive:
+            committed_value = {
+                'hunger': hunger,
+                'thirst': thirst,
+                'cold': cold
+            }[self._committed_drive]
+            
+            # Release if satisfied
+            if committed_value < 0.1:
+                self._committed_drive = None
+                self._commitment_ticks = 0
+                return
+            
+            # Emergency override: Another drive is MUCH higher (2x)
+            max_other = max(
+                hunger if self._committed_drive != 'hunger' else 0,
+                thirst if self._committed_drive != 'thirst' else 0,
+                cold if self._committed_drive != 'cold' else 0
+            )
+            if max_other > committed_value * 2.0:
+                # Switch commitment
+                self._committed_drive = None
+                self._commitment_ticks = 0
+        
+        # Make new commitment if needed
+        if not self._committed_drive or self._commitment_ticks == 0:
+            max_drive = max(hunger, thirst, cold)
+            
+            # Only commit if drive significant
+            if max_drive > 0.3:
+                if hunger == max_drive:
+                    self._committed_drive = 'hunger'
+                elif thirst == max_drive:
+                    self._committed_drive = 'thirst'
+                else:
+                    self._committed_drive = 'cold'
+                
+                self._commitment_ticks = self._commitment_duration
+
 
     def snapshot_vitals(self, energy: float, hydration: float, temperature: float):
         """
@@ -246,6 +354,39 @@ class DriveSystem:
         self._prev_hunger = self._compute_hunger(energy)
         self._prev_thirst = self._compute_thirst(hydration)
         self._prev_cold = self._compute_cold(temperature)
+    
+    def update_position(self, position: np.ndarray, gradient_strength: float):
+        """
+        Track agent position to detect if stuck.
+        Call this every tick with current position and gradient strength.
+        
+        Args:
+            position: Agent's current [x, y] position
+            gradient_strength: Total magnitude of resource gradients
+        """
+        # Add to history
+        self._position_history.append(position.copy())
+        
+        # Keep only recent history
+        if len(self._position_history) > self._history_length:
+            self._position_history.pop(0)
+        
+        # Check if stuck (not moving much)
+        if len(self._position_history) >= self._history_length:
+            # Calculate total distance traveled
+            total_dist = 0.0
+            for i in range(1, len(self._position_history)):
+                delta = self._position_history[i] - self._position_history[i-1]
+                total_dist += np.linalg.norm(delta)
+            
+            # Stuck if:
+            # 1. Barely moving (total_dist < threshold)
+            # 2. AND weak gradients (nothing nearby to pursue)
+            self._is_stuck = (total_dist < self._stuck_threshold and 
+                            gradient_strength < 0.5)
+        else:
+            self._is_stuck = False
+
 
     def compute_internal_reward(
         self,
@@ -305,13 +446,34 @@ class DriveSystem:
         )
         discomfort = -total_drive_pressure * self.config.discomfort_rate
 
-        # ── Consumption bonus: extra kick for actually eating/drinking
+        # ── Consumption bonus: SCALED BY NEED ────────────────
+        # CRITICAL FIX: Reward should be HIGH when consuming what you need,
+        # LOW when consuming what you don't need
         consumption_reward = 0.0
         if consumed_resource is not None:
-            consumption_reward = self.config.consumption_bonus
+            # Determine need level for this resource type
+            if consumed_resource == 'food':
+                need_level = hunger_now
+            elif consumed_resource == 'water':
+                need_level = thirst_now
+            elif consumed_resource == 'heat':
+                need_level = cold_now
+            else:
+                need_level = 0.0
+            
+            # Scale bonus by need: 
+            # No need (0.0) → 10% bonus (0.2)
+            # Max need (1.0) → 100% bonus (2.0)
+            base_bonus = self.config.consumption_bonus  # 2.0
+            consumption_reward = base_bonus * (0.1 + 0.9 * need_level)
+            
             self.total_consumption_events += 1
-            # Consumption is surprising! Reduces curiosity temporarily
-            self.reduce_curiosity_from_surprise(surprise=0.3)
+            
+            # Reduce curiosity MORE if consumption satisfied a real need
+            if need_level > 0.5:
+                self.reduce_curiosity_from_surprise(surprise=0.8)  # Big reduction
+            else:
+                self.reduce_curiosity_from_surprise(surprise=0.3)  # Small reduction
 
         # ── Curiosity reward: small bonus for exploring ────
         # Curiosity drive provides gentle exploration pressure

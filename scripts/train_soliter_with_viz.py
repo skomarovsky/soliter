@@ -210,8 +210,8 @@ class Visualizer:
             else:  # AUTUMN
                 background = (40, 30, 30)  # Dark brownish
         else:
-            # Day: LIGHT BLUE (easy on eyes, good contrast)
-            background = (173, 216, 230)  # Light blue
+            # Day: WHITE background for better visibility
+            background = (255, 255, 255)  # Pure white
         
         self.screen.fill(background)
         
@@ -315,27 +315,55 @@ class Visualizer:
                                (pos[0]+x_size, pos[1]-x_size), 
                                (pos[0]-x_size, pos[1]+x_size), 1)
         
-        # Draw agent - OUTLINE ONLY with direction arrow
+        # Draw agent - OUTLINE ONLY (hollow/transparent) for better visibility
         agent_pos = (int(agent.position[0] * self.scale), int(agent.position[1] * self.scale))
         
-        # Agent body - OUTLINE ONLY (not filled)
-        color = WHITE if agent.is_alive else GRAY
-        agent_radius = int(agent.radius * self.scale)
-        pygame.draw.circle(self.screen, color, agent_pos, agent_radius, 2)  # thickness=2, hollow
+        # Agent body - OUTLINE ONLY (not filled, so transparent center)
+        if is_night:
+            # Night: White outline, yellow arrow
+            outline_color = WHITE if agent.is_alive else (100, 100, 100)
+            arrow_color = YELLOW
+        else:
+            # Day: Black outline, red arrow (transparent center!)
+            outline_color = BLACK if agent.is_alive else (100, 100, 100)
+            arrow_color = RED
         
-        # Agent heading (direction arrow) - THICKER AND LONGER
+        agent_radius = int(agent.radius * self.scale)
+        
+        # Draw OUTLINE ONLY (thickness=3 for visibility, 0 would be filled)
+        pygame.draw.circle(self.screen, outline_color, agent_pos, agent_radius, 3)
+        
+        # Agent heading (direction arrow) - THICKER AND COLORED
         heading_len = 25
         heading_end = (
             agent_pos[0] + int(heading_len * np.cos(agent.heading)),
             agent_pos[1] + int(heading_len * np.sin(agent.heading))
         )
-        pygame.draw.line(self.screen, YELLOW, agent_pos, heading_end, 4)  # Thicker arrow
+        pygame.draw.line(self.screen, arrow_color, agent_pos, heading_end, 4)  # Thick arrow
         
         # Stats panel
         y_offset = self.world_height + 10
         
-        # Cycle info
-        text = self.font.render(f"Cycle: {cycle}  Step: {step}  Consumptions: {total_consumptions}", True, WHITE)
+        # TEXT COLOR: Adaptive for day/night visibility
+        text_color = BLACK if not is_night else WHITE
+        
+        # Cycle info - first line
+        text = self.font.render(f"Cycle: {cycle}  Step: {step}  Consumptions: {total_consumptions}", True, text_color)
+        self.screen.blit(text, (10, y_offset))
+        
+        # Season info - second line
+        y_offset += 25
+        season_name = season.value  # SUMMER, WINTER, SPRING, AUTUMN
+        # Color code seasons
+        if season_name == 'SUMMER':
+            season_color = (255, 100, 0) if not is_night else (255, 150, 0)  # Orange
+        elif season_name == 'WINTER':
+            season_color = (0, 150, 255) if not is_night else (100, 200, 255)  # Blue
+        elif season_name == 'SPRING':
+            season_color = (0, 180, 0) if not is_night else (0, 255, 0)  # Green
+        else:  # AUTUMN
+            season_color = (180, 100, 0) if not is_night else (200, 120, 0)  # Brown
+        text = self.font.render(f"Season: {season_name}", True, season_color)
         self.screen.blit(text, (10, y_offset))
         
         # Vitals
@@ -347,7 +375,7 @@ class Visualizer:
         energy_pct = agent.energy / 100.0
         pygame.draw.rect(self.screen, GRAY, (10, y_offset, vital_width, bar_height))
         pygame.draw.rect(self.screen, GREEN, (10, y_offset, int(vital_width * energy_pct), bar_height))
-        text = self.small_font.render(f"Energy: {agent.energy:.0f}", True, WHITE)
+        text = self.small_font.render(f"Energy: {agent.energy:.0f}", True, text_color)
         self.screen.blit(text, (220, y_offset))
         
         y_offset += 20
@@ -356,7 +384,7 @@ class Visualizer:
         hydration_pct = agent.hydration / 100.0
         pygame.draw.rect(self.screen, GRAY, (10, y_offset, vital_width, bar_height))
         pygame.draw.rect(self.screen, BLUE, (10, y_offset, int(vital_width * hydration_pct), bar_height))
-        text = self.small_font.render(f"Hydration: {agent.hydration:.0f}", True, WHITE)
+        text = self.small_font.render(f"Hydration: {agent.hydration:.0f}", True, text_color)
         self.screen.blit(text, (220, y_offset))
         
         y_offset += 20
@@ -365,7 +393,7 @@ class Visualizer:
         temp_pct = agent.temperature / 100.0
         pygame.draw.rect(self.screen, GRAY, (10, y_offset, vital_width, bar_height))
         pygame.draw.rect(self.screen, RED, (10, y_offset, int(vital_width * temp_pct), bar_height))
-        text = self.small_font.render(f"Temp: {agent.temperature:.1f}°C", True, WHITE)
+        text = self.small_font.render(f"Temp: {agent.temperature:.1f}°C", True, text_color)
         self.screen.blit(text, (220, y_offset))
         
         y_offset += 20
@@ -374,7 +402,7 @@ class Visualizer:
         wake_pct = agent.wakefulness
         pygame.draw.rect(self.screen, GRAY, (10, y_offset, vital_width, bar_height))
         pygame.draw.rect(self.screen, CYAN, (10, y_offset, int(vital_width * wake_pct), bar_height))
-        text = self.small_font.render(f"Wake: {agent.wakefulness:.2f}", True, WHITE)
+        text = self.small_font.render(f"Wake: {agent.wakefulness:.2f}", True, text_color)
         self.screen.blit(text, (220, y_offset))
         
         # Drive states (right side)
@@ -382,7 +410,7 @@ class Visualizer:
             x_offset = 450
             y_offset = self.world_height + 10
             
-            text = self.font.render("Drive States:", True, WHITE)
+            text = self.font.render("Drive States:", True, text_color)
             self.screen.blit(text, (x_offset, y_offset))
             
             y_offset += 30
@@ -414,7 +442,7 @@ class Visualizer:
                 pygame.draw.rect(self.screen, drive_color, (x_offset, y_offset, int(vital_width * drive_val), bar_height))
                 
                 # Value text on the right of bar
-                value_text = self.small_font.render(f"{drive_val:.2f}", True, WHITE)
+                value_text = self.small_font.render(f"{drive_val:.2f}", True, text_color)
                 self.screen.blit(value_text, (x_offset + vital_width + 5, y_offset + 2))
                 
                 y_offset += 25  # More spacing
@@ -677,6 +705,9 @@ def main():
         
         # Save log
         log_path = save_training_log(training_log, output_dir)
+        
+        # Print learning diagnostics
+        trainer.print_learning_summary()
         
         print(f"\n{'='*70}")
         print(f"TRAINING COMPLETE")

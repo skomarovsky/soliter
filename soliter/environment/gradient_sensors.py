@@ -42,10 +42,16 @@ class GradientSensorConfig:
     """Configuration for gradient sensing."""
 
     # Scale factor for inverse-distance falloff
+    # ADAPTIVE: Should be ~20% of world size for good coverage
+    # For 200×200 world: 40 (was 250 - too weak!)
+    # For 1000×1000 world: 200
     # At this distance, signal strength = 0.5
-    # For 1000×1000 world: 250 means signal is detectable from anywhere
-    # For 200×200 world: 50 would be appropriate
-    scale_factor: float = 250.0
+    scale_factor: float = 50.0  # Default for medium worlds
+    
+    # Strength exponent (< 1.0 makes falloff slower)
+    # 1.0 = linear falloff
+    # 0.7 = slower falloff (stronger at medium distances)
+    falloff_exponent: float = 0.7
 
     # Noise parameters
     # Gradient sensing is impaired by low wakefulness/hydration
@@ -53,7 +59,7 @@ class GradientSensorConfig:
     noise_scale: float = 0.1
 
     # Whether to use toroidal (wrapping) distance
-    toroidal: bool = True
+    toroidal: bool = False  # Changed to False - hard walls!
 
 
 class GradientSensors:
@@ -104,6 +110,12 @@ class GradientSensors:
         """
         gradients = np.zeros(6, dtype=np.float32)
 
+        # WALL AVOIDANCE: Add repulsive gradient from walls
+        # When agent is near a wall with no resource gradients, push it away
+        wall_avoidance = self._compute_wall_avoidance(
+            agent_position, world_width, world_height
+        )
+        
         # CRITICAL: Only sense resources that have capacity (not depleted)
         # Filter out depleted resources - no point sensing what you can't consume!
         
@@ -134,23 +146,19 @@ class GradientSensors:
         )
         gradients[4:6] = heat_grad
 
-        # DRIVE-MODULATED ATTENTION: Amplify gradients based on need
-        # When hungry, food gradients become more salient (selective attention)
-        # Biological basis: Hungry animals have enhanced olfaction for food
-        if drive_states is not None:
-            hunger = drive_states.get('hunger', 0.0)
-            thirst = drive_states.get('thirst', 0.0)
-            cold = drive_states.get('cold', 0.0)
-            
-            # Amplification: 1.0 (no drive) → 3.0 (max drive)
-            # This makes weak gradients stronger when needed
-            food_amp = 1.0 + 2.0 * hunger
-            water_amp = 1.0 + 2.0 * thirst
-            heat_amp = 1.0 + 2.0 * cold
-            
-            gradients[0:2] *= food_amp
-            gradients[2:4] *= water_amp
-            gradients[4:6] *= heat_amp
+        # NOTE: Drive-based prioritization moved to DriveSystem!
+        # Cleaner separation: gradients = spatial info, drives = motivation
+        # DriveSystem.get_drive_vector() applies commitment boost/suppression
+
+        # WALL ESCAPE: If no strong resource gradient, add wall avoidance
+        # This prevents agent from getting stuck rotating at walls
+        total_gradient_strength = np.linalg.norm(gradients)
+        if total_gradient_strength < 0.5:  # Weak or no resource gradients
+            # Add wall avoidance to help escape
+            # Apply to all resource gradient channels
+            gradients[0:2] += wall_avoidance  # food
+            gradients[2:4] += wall_avoidance  # water
+            gradients[4:6] += wall_avoidance  # heat
 
         # Apply noise (impaired senses)
         if sensor_noise > 0:
@@ -242,3 +250,60 @@ class GradientSensors:
             dy = dy - np.sign(dy) * height
 
         return float(dx), float(dy)
+    
+    def _compute_wall_avoidance(
+        self,
+        agent_pos: np.ndarray,
+        world_width: float,
+        world_height: float,
+    ) -> np.ndarray:
+        """
+        Compute repulsive gradient from walls.
+        
+        When agent is near a wall, push it back toward the center.
+        This prevents agent from getting stuck rotating at walls.
+        
+        Returns:
+            2D gradient vector pointing away from nearest wall
+        """
+        x, y = agent_pos[0], agent_pos[1]
+        
+        # Wall proximity threshold (activate when within this distance)
+        wall_threshold = 15.0  # units from wall
+        
+        # Compute distance to each wall
+        dist_left = x
+        dist_right = world_width - x
+        dist_bottom = y  
+        dist_top = world_height - y
+        
+        # Find minimum distance to any wall
+        min_dist = min(dist_left, dist_right, dist_bottom, dist_top)
+        
+        # Only activate if near a wall
+        if min_dist > wall_threshold:
+            return np.zeros(2, dtype=np.float32)
+        
+        # Compute avoidance vector (points away from nearest wall)
+        avoidance = np.zeros(2, dtype=np.float32)
+        
+        # Strength increases as agent gets closer to wall
+        # strength = 1.0 at wall, 0.0 at threshold
+        strength = 1.0 - (min_dist / wall_threshold)
+        strength = max(0.0, min(1.0, strength))
+        
+        # Push away from the nearest wall
+        if min_dist == dist_left:
+            # Near left wall → push right
+            avoidance[0] = strength * 0.8
+        elif min_dist == dist_right:
+            # Near right wall → push left
+            avoidance[0] = -strength * 0.8
+        elif min_dist == dist_bottom:
+            # Near bottom wall → push up
+            avoidance[1] = strength * 0.8
+        elif min_dist == dist_top:
+            # Near top wall → push down
+            avoidance[1] = -strength * 0.8
+        
+        return avoidance

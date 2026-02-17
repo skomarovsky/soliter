@@ -332,14 +332,15 @@ class SoliterAgent:
     
     def should_allow_turning(self, current_drives: np.ndarray) -> bool:
         """
-        BIOLOGICAL: Direction stability - like vacuum cleaners!
+        BIOLOGICAL: Direction stability - STRONG version!
         
-        Only allow turning when there's a REASON:
-        1. Drives changed significantly (new goal)
-        2. Been going straight long enough (cooldown expired)
-        3. Near obstacle/wall
+        When agent has a HIGH PRIORITY DRIVE, it should GO STRAIGHT toward goal.
+        NO spinning, NO meandering - STRAIGHT LINE!
         
-        This prevents constant oscillation from network noise.
+        Only allow turning when:
+        1. Drives changed significantly (new priority)
+        2. Drive is LOW (exploration mode - can turn freely)
+        3. Been going straight for cooldown period
         
         Args:
             current_drives: [hunger, thirst, cold, curiosity]
@@ -347,22 +348,50 @@ class SoliterAgent:
         Returns:
             True if turning is allowed, False if should go straight
         """
-        # Always allow turning if cooldown expired
-        if self.ticks_since_direction_change >= self.config.direction_change_cooldown:
-            return True
+        # Find max drive
+        max_drive = np.max(current_drives)
         
-        # Check if any drive changed significantly
-        drive_changes = np.abs(current_drives - self.last_drive_state)
-        max_drive_change = np.max(drive_changes)
+        # IF HIGH DRIVE: Very strict turning control
+        if max_drive > 0.3:
+            # High drive = strong goal = GO STRAIGHT!
+            
+            # Only allow turning if drive changed significantly
+            drive_changes = np.abs(current_drives - self.last_drive_state)
+            max_drive_change = np.max(drive_changes)
+            
+            # Higher threshold when drive is high
+            # Need BIG change (>0.2) to allow turning
+            if max_drive_change > 0.2:
+                self.last_drive_state = current_drives.copy()
+                self.ticks_since_direction_change = 0
+                return True
+            
+            # Or if cooldown expired (longer when drive high)
+            cooldown = int(100 * max_drive)  # 30-100 ticks based on drive
+            if self.ticks_since_direction_change >= cooldown:
+                self.last_drive_state = current_drives.copy()
+                self.ticks_since_direction_change = 0
+                return True
+            
+            # Otherwise: GO STRAIGHT!
+            self.ticks_since_direction_change += 1
+            return False
         
-        if max_drive_change > self.config.direction_stability_threshold:
-            # Significant drive change → new goal → allow turning
-            self.last_drive_state = current_drives.copy()
-            self.ticks_since_direction_change = 0
-            return True
-        
-        # No significant change → maintain direction
-        self.ticks_since_direction_change += 1
+        else:
+            # LOW DRIVE: Exploration mode - allow turning more freely
+            if self.ticks_since_direction_change >= 20:  # Short cooldown
+                return True
+            
+            drive_changes = np.abs(current_drives - self.last_drive_state)
+            max_drive_change = np.max(drive_changes)
+            
+            if max_drive_change > 0.1:  # Lower threshold
+                self.last_drive_state = current_drives.copy()
+                self.ticks_since_direction_change = 0
+                return True
+            
+            self.ticks_since_direction_change += 1
+
         return False
     
     def move(self, velocity: float, turn: float, allow_turning: bool = True, world_bounds: Tuple[float, float] = None, dt: float = 1.0) -> None:
@@ -408,11 +437,43 @@ class SoliterAgent:
         self.last_delta = np.array([dx, dy])
         self.position += self.last_delta
         
-        # CRITICAL: Enforce world boundaries (prevent escape)
+        # CRITICAL: Enforce world boundaries - HARD WALLS (no wrapping)
+        # Agent bounces off walls instead of wrapping around
         if world_bounds is not None:
             world_width, world_height = world_bounds
+            
+            # Save old position to detect collision
+            old_pos = self.position.copy()
+            
+            # Clip to boundaries (hard walls)
             self.position[0] = np.clip(self.position[0], 0, world_width - 1)
             self.position[1] = np.clip(self.position[1], 0, world_height - 1)
+            
+            # Check if we hit a wall
+            hit_x = (self.position[0] != old_pos[0])
+            hit_y = (self.position[1] != old_pos[1])
+            
+            if hit_x or hit_y:
+                # Bounce: point AWAY from wall (perpendicular)
+                if hit_x:
+                    # Hit left or right wall - point horizontally away
+                    if self.position[0] <= 5:
+                        self.rotation = 0.0  # Point right →
+                    else:
+                        self.rotation = np.pi  # Point left ←
+                
+                if hit_y:
+                    # Hit top or bottom wall - point vertically away
+                    if self.position[1] <= 5:
+                        self.rotation = np.pi / 2  # Point down ↓
+                    else:
+                        self.rotation = -np.pi / 2  # Point up ↑
+                
+                # Update heading to match
+                self.heading = self.rotation
+                
+                # Reset turn momentum (prevent sliding)
+                self.last_turn = 0.0
     
     def _check_death(self) -> None:
         """
