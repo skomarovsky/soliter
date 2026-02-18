@@ -114,8 +114,10 @@ class REINFORCETrainer:
         
         # Update vitals
         self.agent.update_vitals(
-            self.world.get_ambient_temperature(),
-            self.world.config.seasonal_period,
+            velocity=self.agent.last_velocity,
+            ambient_temperature=self.world.get_ambient_temperature(),
+            turn=self.agent.last_turn,
+            dt=1.0,
         )
         
         # Compute reward
@@ -210,7 +212,17 @@ class REINFORCETrainer:
     def _check_resource_consumption(self, resources):
         self._consumed_this_tick = None
         seasonal_period = self.world.config.seasonal_period
+        
+        # Only consume if actually needed (not already full/satisfied)
+        # Moderate difficulty: eat at 80%, gives ~1.6 cycle buffer
+        needs_food = self.agent.energy < 80.0  # Eat when getting low
+        needs_water = self.agent.hydration < 80.0  # Drink when getting low
+        needs_heat = self.agent.temperature < 34.0  # Too cold (normal is 37°C)
+        needs_cooling = self.agent.temperature > 40.0  # Too hot (danger at 45°C)
+        
         for feeder in resources.get('feeders', []):
+            if not needs_food:
+                continue  # Skip if already full!
             if feeder.is_agent_in_consumption_range(self.agent.position):
                 if feeder.can_consume():
                     amount = feeder.consume(self.world.tick, seasonal_period)
@@ -218,7 +230,10 @@ class REINFORCETrainer:
                         self.agent.consume_resource('food', amount)
                         self._consumed_this_tick = 'food'
                         return
+        
         for fountain in resources.get('fountains', []):
+            if not (needs_water or needs_cooling):
+                continue  # Skip if already hydrated and not overheating!
             if fountain.is_agent_in_consumption_range(self.agent.position):
                 if fountain.can_consume():
                     amount = fountain.consume(self.world.tick, seasonal_period)
@@ -226,7 +241,10 @@ class REINFORCETrainer:
                         self.agent.consume_resource('water', amount)
                         self._consumed_this_tick = 'water'
                         return
+        
         for heater in resources.get('heaters', []):
+            if not needs_heat:
+                continue  # Skip if already warm!
             if heater.is_agent_in_consumption_range(self.agent.position):
                 if heater.can_consume():
                     amount = heater.consume(self.world.tick, seasonal_period)

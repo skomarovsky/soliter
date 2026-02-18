@@ -219,7 +219,8 @@ def create_default_resources(world_width: int = 1000, world_height: int = 1000) 
     '''Create a default set of resources scattered in the world.'''
     np.random.seed(42)  # Reproducible placement
     
-    num_each = 5
+    # Extreme scarcity for 400×400 world - only 2 of each resource!
+    num_each = 2  # Was 3 - reduced further for real survival pressure
     
     feeders = []
     fountains = []
@@ -241,8 +242,8 @@ def create_default_resources(world_width: int = 1000, world_height: int = 1000) 
             detection_radius=30.0,    # Can sense from 30 units (gradient)
             consumption_radius=5.0,   # Must be within 5 units to eat (STRICT!)
             restore_rate=15.0,
-            max_capacity=200.0,       # Capacity = ~13 consumptions before depletion
-            recovery_rate=0.05,       # VERY SLOW: 0.05 units/tick = 4000 ticks for full recovery
+            max_capacity=200.0,
+            recovery_rate=0.5,        # INCREASED 10x: 0.5 units/tick = 1000 units/cycle recovery
             recovery_cooldown=300     # LONG COOLDOWN: 300 ticks before recovery starts
         )))
         
@@ -256,9 +257,9 @@ def create_default_resources(world_width: int = 1000, world_height: int = 1000) 
             detection_radius=25.0,    # Can sense from 25 units
             consumption_radius=5.0,   # Must be within 5 units to drink
             restore_rate=12.0,
-            max_capacity=240.0,       # Capacity = ~20 consumptions
-            recovery_rate=0.08,       # SLOW: 0.08 units/tick = 3000 ticks for full recovery
-            recovery_cooldown=250     # LONG COOLDOWN: 250 ticks
+            max_capacity=240.0,
+            recovery_rate=0.8,        # INCREASED 10x: 0.8 units/tick = 1600 units/cycle recovery
+            recovery_cooldown=250
         )))
         
         # Heater - Heat depletes fast, forces movement
@@ -272,9 +273,9 @@ def create_default_resources(world_width: int = 1000, world_height: int = 1000) 
                 detection_radius=40.0,    # Can sense from 40 units
                 consumption_radius=8.0,   # Must be within 8 units for heat
                 restore_rate=8.0,
-                max_capacity=120.0,       # Capacity = ~15 consumptions
-                recovery_rate=0.06,       # SLOW: 0.06 units/tick = 2000 ticks
-                recovery_cooldown=200     # MEDIUM COOLDOWN: 200 ticks
+                max_capacity=120.0,
+                recovery_rate=0.3,        # INCREASED 10x: 0.3 units/tick = 600 units/cycle recovery
+                recovery_cooldown=200
             ),
             night_radius_multiplier=0.5  # At night: 8 * 0.5 = 4 units (very close!)
         ))

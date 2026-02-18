@@ -69,7 +69,7 @@ class DriveConfig:
     # Resource consumption bonus
     # Extra satisfaction when actually consuming a resource
     # (on top of drive reduction from vitals change)
-    consumption_bonus: float = 10.0  # INCREASED: Makes consumption highly rewarding
+    consumption_bonus: float = 20.0  # HIGH: Make consumption highly rewarding!
 
 
 class DriveSystem:

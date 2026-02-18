@@ -132,8 +132,8 @@ class DriveModulatedNCPBrain(nn.Module):
             drives=drives,  # ← Drives modulate interneurons internally!
         )
         
-        # Store hidden state
-        self.hidden_state = new_hidden
+        # Store hidden state (detached to prevent graph accumulation across timesteps)
+        self.hidden_state = new_hidden.detach()
         
         # Remove batch/sequence dims if input was single
         if was_single:

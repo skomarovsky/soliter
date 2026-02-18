@@ -23,9 +23,9 @@ class VitalsConfig:
     initial_temperature: float = 37.0  # Celsius
     initial_wakefulness: float = 1.0
     
-    # Decay rates
-    energy_decay_base: float = 0.01
-    hydration_decay_base: float = 0.008
+    # Decay rates (moderate - agent survives ~2 cycles without food)
+    energy_decay_base: float = 0.025     # 100→0 in 4000 ticks (2 cycles)
+    hydration_decay_base: float = 0.02   # 100→0 in 5000 ticks (2.5 cycles)
     temperature_decay_rate: float = 0.05
     wakefulness_decay_rate: float = 0.0001
     
@@ -129,13 +129,12 @@ class SoliterAgent:
         self.ticks_since_direction_change = 0
         
         if after_death:
-            # DEATH PENALTY: Respawn with barely enough to survive
-            # Prevents death exploitation - dying should NOT be a strategy!
-            # Agent gets 1/4 of initial resources - just enough to start searching
-            self.energy = self.config.initial_energy * 0.25  # 25% energy
-            self.hydration = self.config.initial_hydration * 0.25  # 25% hydration
+            # DEATH PENALTY: Respawn with reduced resources (not minimal)
+            # 50% gives survival pressure without making recovery impossible
+            self.energy = self.config.initial_energy * 0.5  # 50% energy (was 25%)
+            self.hydration = self.config.initial_hydration * 0.5  # 50% hydration (was 25%)
             self.temperature = self.config.initial_temperature  # Normal temp (37°C)
-            self.wakefulness = 0.5  # Groggy after death
+            self.wakefulness = 0.7  # Slightly groggy (was 0.5)
         else:
             # Normal reset (first spawn)
             self.energy = self.config.initial_energy
@@ -240,8 +239,9 @@ class SoliterAgent:
         # ENERGY SYSTEM
         # ═══════════════════════════════════════════════════════════
         # Energy decay (faster when moving OR turning)
-        movement_cost = velocity ** 2
-        turning_cost = abs(turn) * 0.5  # Turning costs energy
+        # Movement cost reduced - quadratic was too punishing
+        movement_cost = velocity * 0.15  # Linear, not quadratic! (was velocity²)
+        turning_cost = abs(turn) * 0.3  # Reduced from 0.5
         energy_decay = self.config.energy_decay_base * (1 + movement_cost + turning_cost)
         self.energy -= energy_decay * dt
         
@@ -471,6 +471,10 @@ class SoliterAgent:
                 
                 # Update heading to match
                 self.heading = self.rotation
+                
+                # CRITICAL: Zero velocity to prevent wall-sticking
+                self.last_velocity = 0.0
+                self.last_delta = np.array([0.0, 0.0])
                 
                 # Reset turn momentum (prevent sliding)
                 self.last_turn = 0.0

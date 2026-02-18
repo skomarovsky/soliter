@@ -201,58 +201,80 @@ class ProfessionalVisualizer:
     
     def _draw_agent(self, agent, is_night: bool):
         """
-        Draw agent with:
-        - Semi-transparent body
-        - Visible collision radius
+        Draw agent as a small fly-like creature.
+        - Tiny body (3-4 pixels)
+        - Semi-transparent wings
         - Heading indicator
-        - Sense circles (optional)
         """
         agent_pos = (int(agent.position[0] * self.scale),
                      int(agent.position[1] * self.scale))
-        agent_radius = int(agent.radius * self.scale)  # 10 * 4 = 40 pixels
         
-        # Create transparent surface for agent
-        agent_surface = pygame.Surface((agent_radius * 3, agent_radius * 3), pygame.SRCALPHA)
-        center = (agent_radius * 1.5, agent_radius * 1.5)
+        # Fly body is TINY (agent.radius=10 → 40 pixels, but we draw 3-4 pixel body)
+        body_size = 3 if self.scale <= 4 else 4
         
-        # Body color (semi-transparent)
+        # Colors
         if not agent.is_alive:
-            body_color = (100, 100, 100, 100)  # Gray, transparent
-            heading_color = (80, 80, 80)
+            body_color = (80, 80, 80)
+            wing_color = (100, 100, 100, 60)  # Gray, very transparent
+            heading_color = (60, 60, 60)
         elif is_night:
-            body_color = (100, 100, 200, 150)  # Blue, semi-transparent
+            body_color = (200, 200, 255)  # Light blue (visible at night)
+            wing_color = (150, 150, 200, 80)  # Blue-ish transparent
             heading_color = YELLOW
         else:
-            body_color = (200, 100, 100, 150)  # Red-ish, semi-transparent
+            body_color = (40, 40, 40)  # Dark body (visible during day)
+            wing_color = (200, 200, 200, 60)  # Light gray transparent
             heading_color = RED
         
-        # Draw body (filled circle with transparency)
-        pygame.draw.circle(agent_surface, body_color, 
-                         (int(center[0]), int(center[1])), agent_radius, 0)
+        # Create surface for transparent wings
+        wing_surface = pygame.Surface((80, 80), pygame.SRCALPHA)
+        wing_center = (40, 40)
         
-        # Draw outline (visible boundary)
-        outline_color = WHITE if is_night else BLACK
-        pygame.draw.circle(agent_surface, outline_color,
-                         (int(center[0]), int(center[1])), agent_radius, 2)
+        # Wing shape: two ovals at angles from body
+        wing_length = 12
+        wing_width = 6
         
-        # Blit agent surface to screen
-        agent_rect = agent_surface.get_rect(center=agent_pos)
-        self.screen.blit(agent_surface, agent_rect)
+        # Left wing
+        left_wing_angle = agent.heading + np.pi/3  # 60° left
+        left_end = (
+            int(wing_center[0] + wing_length * np.cos(left_wing_angle)),
+            int(wing_center[1] + wing_length * np.sin(left_wing_angle))
+        )
+        pygame.draw.ellipse(
+            wing_surface, wing_color,
+            (left_end[0]-wing_width, left_end[1]-wing_length//2, wing_width*2, wing_length),
+            0
+        )
         
-        # Heading indicator (arrow from center)
-        heading_len = int(agent_radius * 0.8)  # 80% of radius
+        # Right wing  
+        right_wing_angle = agent.heading - np.pi/3  # 60° right
+        right_end = (
+            int(wing_center[0] + wing_length * np.cos(right_wing_angle)),
+            int(wing_center[1] + wing_length * np.sin(right_wing_angle))
+        )
+        pygame.draw.ellipse(
+            wing_surface, wing_color,
+            (right_end[0]-wing_width, right_end[1]-wing_length//2, wing_width*2, wing_length),
+            0
+        )
+        
+        # Blit wings to screen
+        wing_rect = wing_surface.get_rect(center=agent_pos)
+        self.screen.blit(wing_surface, wing_rect)
+        
+        # Draw tiny body (filled circle)
+        pygame.draw.circle(self.screen, body_color, agent_pos, body_size, 0)
+        
+        # Heading indicator (short line from body)
+        heading_len = 15
         heading_end = (
             agent_pos[0] + int(heading_len * np.cos(agent.heading)),
             agent_pos[1] + int(heading_len * np.sin(agent.heading))
         )
-        pygame.draw.line(self.screen, heading_color, agent_pos, heading_end, 3)
+        pygame.draw.line(self.screen, heading_color, agent_pos, heading_end, 2)
         
-        # Small dot at arrow end
-        pygame.draw.circle(self.screen, heading_color, heading_end, 4, 0)
-        
-        # Sense circle (agent's detection range)
-        sense_color = CYAN if is_night else (0, 200, 200)
-        pygame.draw.circle(self.screen, sense_color, agent_pos, agent_radius, 1)
+        # Tiny dot at arrow tip
+        pygame.draw.circle(self.screen, heading_color, heading_end, 2, 0)
     
     def _draw_dashboard(self, agent, trainer, world, season, is_night: bool,
                        cycle: int, step: int, total_consumptions: int,
@@ -282,7 +304,7 @@ class ProfessionalVisualizer:
         self.screen.blit(text, (10, y))
         
         # Day/Night indicator
-        time_text = "🌙 NIGHT" if is_night else "☀️ DAY"
+        time_text = "NIGHT" if is_night else "DAY"
         text = self.font.render(time_text, True, text_color)
         self.screen.blit(text, (250, y))
         y += 30
